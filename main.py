@@ -3,7 +3,6 @@ import re
 import html
 from typing import Optional
 
-import requests
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -21,7 +20,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 SOURCE_CHANNEL = int(os.getenv("SOURCE_CHANNEL", "0"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 TARGET_MESSAGE_THREAD_ID = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0"))
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
 
 # =========================================================
@@ -266,7 +264,7 @@ def stylize_lines(text: str) -> str:
     return "\n\n".join(out).strip()
 
 
-def transform_for_telegram(raw_text: str) -> Optional[str]:
+def transform_ifttt_text(raw_text: str) -> Optional[str]:
     text = basic_cleanup(raw_text)
     if not text:
         return None
@@ -277,80 +275,17 @@ def transform_for_telegram(raw_text: str) -> Optional[str]:
     return text or None
 
 
-def transform_for_discord(raw_text: str) -> Optional[str]:
-    text = basic_cleanup(raw_text)
-    return text or None
-
-
-def split_discord_message(text: str, limit: int = 1900) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-
-    parts = []
-    current = ""
-
-    for block in text.split("\n\n"):
-        block = block.strip()
-        if not block:
-            continue
-
-        candidate = f"{current}\n\n{block}".strip() if current else block
-
-        if len(candidate) <= limit:
-            current = candidate
-        else:
-            if current:
-                parts.append(current)
-            if len(block) <= limit:
-                current = block
-            else:
-                for i in range(0, len(block), limit):
-                    chunk = block[i:i + limit].strip()
-                    if chunk:
-                        parts.append(chunk)
-                current = ""
-
-    if current:
-        parts.append(current)
-
-    return parts
-
-
-async def send_to_telegram(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+async def send_to_target(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     kwargs = {
         "chat_id": TARGET_CHAT_ID,
+        "message_thread_id": TARGET_MESSAGE_THREAD_ID,
         "text": text,
         "parse_mode": ParseMode.HTML,
         "disable_web_page_preview": True,
     }
 
-    if TARGET_MESSAGE_THREAD_ID:
-        kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
-
     await context.bot.send_message(**kwargs)
-    log("Sent message to Telegram target")
-
-
-def send_to_discord(text: str) -> None:
-    if not DISCORD_WEBHOOK_URL:
-        log("Discord webhook not configured, skip Discord send")
-        return
-
-    parts = split_discord_message(text)
-
-    for part in parts:
-        response = requests.post(
-            DISCORD_WEBHOOK_URL,
-            json={"content": part},
-            timeout=20,
-        )
-
-        if response.status_code not in (200, 204):
-            raise RuntimeError(
-                f"Discord webhook failed: {response.status_code} {response.text}"
-            )
-
-    log("Sent message to Discord")
+    log("Sent text-only message to target")
 
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -368,26 +303,14 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         log("Skip: not source channel")
         return
 
-    telegram_result = transform_for_telegram(raw_text)
-    discord_result = transform_for_discord(raw_text)
-
-    if not telegram_result and not discord_result:
+    result = transform_ifttt_text(raw_text)
+    if not result:
         log("Skip: empty result after transform")
         return
 
-    if telegram_result:
-        log("Final Telegram text:\n", telegram_result)
-        try:
-            await send_to_telegram(context, telegram_result)
-        except Exception as e:
-            log("Telegram send error:", str(e))
+    log("Final text:\n", result)
 
-    if discord_result:
-        log("Final Discord text:\n", discord_result)
-        try:
-            send_to_discord(discord_result)
-        except Exception as e:
-            log("Discord send error:", str(e))
+    await send_to_target(context, result)
 
 
 def main():
@@ -399,7 +322,7 @@ def main():
         MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post)
     )
 
-    print("Unified bot started...")
+    print("Bot started...")
     app.run_polling(drop_pending_updates=True)
 
 
