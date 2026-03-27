@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import requests
 from typing import Optional
 
 from telegram import Update
@@ -13,7 +14,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# SETTINGS FROM ENV
+# SETTINGS
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -21,6 +22,9 @@ SOURCE_CHANNEL = int(os.getenv("SOURCE_CHANNEL", "0"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 TARGET_MESSAGE_THREAD_ID = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0"))
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
+
+# Pipedream webhook URL
+PIPEDREAM_WEBHOOK_URL = "https://eon5ixlgvwu4zqi.m.pipedream.net"
 
 # =========================================================
 
@@ -32,12 +36,18 @@ def validate_env():
         raise ValueError("SOURCE_CHANNEL is not set")
     if TARGET_CHAT_ID == 0:
         raise ValueError("TARGET_CHAT_ID is not set")
+    if not PIPEDREAM_WEBHOOK_URL:
+        raise ValueError("PIPEDREAM_WEBHOOK_URL is not set")
 
 
 def log(*args):
     if DEBUG:
         print(*args)
 
+
+# =========================================================
+# SHARED CLEANUP
+# =========================================================
 
 def remove_source_header(text: str) -> str:
     lines = [line.rstrip() for line in text.splitlines()]
@@ -83,6 +93,10 @@ def basic_cleanup(text: str) -> str:
     text = cleanup_whitespace(text)
     return text
 
+
+# =========================================================
+# TELEGRAM TRANSFORM (как у тебя было)
+# =========================================================
 
 def normalize_money_ranges(line: str) -> str:
     line = re.sub(r"(\d+(?:\.\d+)?\$)\s*-\s*(\d+(?:\.\d+)?\$)", r"\1–\2", line)
@@ -228,7 +242,7 @@ def is_signal_like_line(line: str) -> bool:
     return has_ticker or any(p in line_low for p in signal_patterns)
 
 
-def process_line(line: str) -> str:
+def process_tg_line(line: str) -> str:
     line = normalize_money_ranges(line)
 
     if is_service_line(line):
@@ -248,7 +262,7 @@ def process_line(line: str) -> str:
     return cleanup_whitespace(line)
 
 
-def stylize_lines(text: str) -> str:
+def stylize_tg_lines(text: str) -> str:
     lines = [line.strip() for line in text.splitlines()]
     out = []
 
@@ -256,7 +270,7 @@ def stylize_lines(text: str) -> str:
         if not line:
             continue
 
-        line = process_line(line)
+        line = process_tg_line(line)
 
         if line:
             out.append(line)
@@ -264,16 +278,80 @@ def stylize_lines(text: str) -> str:
     return "\n\n".join(out).strip()
 
 
-def transform_ifttt_text(raw_text: str) -> Optional[str]:
+def transform_ifttt_text_for_telegram(raw_text: str) -> Optional[str]:
     text = basic_cleanup(raw_text)
     if not text:
         return None
 
-    text = stylize_lines(text)
+    text = stylize_tg_lines(text)
     text = cleanup_whitespace(text)
 
     return text or None
 
+
+# =========================================================
+# DISCORD / PIPEDREAM TRANSFORM (без перевода)
+# =========================================================
+
+def transform_text_for_discord(raw_text: str) -> Optional[str]:
+    text = basic_cleanup(raw_text)
+    if not text:
+        return None
+
+    return text or None
+
+
+def split_text(text: str, limit: int = 1900) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+
+    parts = []
+    current = ""
+
+    for block in text.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+
+        candidate = f"{current}\n\n{block}".strip() if current else block
+
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                parts.append(current)
+            if len(block) <= limit:
+                current = block
+            else:
+                for i in range(0, len(block), limit):
+                    chunk = block[i:i + limit].strip()
+                    if chunk:
+                        parts.append(chunk)
+                current = ""
+
+    if current:
+        parts.append(current)
+
+    return parts
+
+
+def send_to_pipedream(text: str):
+    parts = split_text(text)
+
+    for part in parts:
+        response = requests.post(
+            PIPEDREAM_WEBHOOK_URL,
+            json={"text": part},
+            timeout=20,
+        )
+        response.raise_for_status()
+
+    log("Sent to Pipedream")
+
+
+# =========================================================
+# SENDERS
+# =========================================================
 
 async def send_to_target(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     kwargs = {
@@ -285,8 +363,12 @@ async def send_to_target(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     }
 
     await context.bot.send_message(**kwargs)
-    log("Sent text-only message to target")
+    log("Sent message to Telegram target")
 
+
+# =========================================================
+# HANDLER
+# =========================================================
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.channel_post
@@ -303,15 +385,29 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         log("Skip: not source channel")
         return
 
-    result = transform_ifttt_text(raw_text)
-    if not result:
-        log("Skip: empty result after transform")
-        return
+    # Telegram version
+    tg_result = transform_ifttt_text_for_telegram(raw_text)
+    if tg_result:
+        log("Final Telegram text:\n", tg_result)
+        await send_to_target(context, tg_result)
+    else:
+        log("Skip Telegram: empty result")
 
-    log("Final text:\n", result)
+    # Discord version through Pipedream
+    dc_result = transform_text_for_discord(raw_text)
+    if dc_result:
+        log("Final Discord text:\n", dc_result)
+        try:
+            send_to_pipedream(dc_result)
+        except Exception as e:
+            log("Pipedream send error:", str(e))
+    else:
+        log("Skip Discord: empty result")
 
-    await send_to_target(context, result)
 
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
     validate_env()
@@ -322,7 +418,7 @@ def main():
         MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post)
     )
 
-    print("Bot started...")
+    print("Unified bot started...")
     app.run_polling(drop_pending_updates=True)
 
 
