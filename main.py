@@ -46,6 +46,87 @@ def log(*args):
 
 
 # =========================================================
+# FILTERS
+# =========================================================
+
+def looks_like_signal(text: str) -> bool:
+    if not text:
+        return False
+
+    lower = text.lower()
+
+    signal_patterns = [
+        r"\$\w+",                 # $BTC, $ETH, etc.
+        r"\blong\b",
+        r"\bshort\b",
+        r"\bdca\b",
+        r"\bsl\b",
+        r"\btp\b",
+        r"\bentry\b",
+        r"\bstop\s*loss\b",
+        r"\btake\s*profit\b",
+        r"\bclosed?\b",
+        r"\btarget\b",
+        r"\bopen(ed)?\b",
+        r"\bavg\b",
+        r"\bscalp\b",
+        r"\bswing\b",
+        r"\bre-?entry\b",
+        r"\bbang on\b",
+        r"\bbang bang\b",
+    ]
+
+    return any(re.search(pattern, lower) for pattern in signal_patterns)
+
+
+def looks_like_spam_or_promo(text: str) -> bool:
+    if not text:
+        return True
+
+    lower = text.lower()
+
+    spam_patterns = [
+        r"@\w+",                  # mentions
+        r"https?://",
+        r"t\.me/",
+        r"twitter\.com/",
+        r"x\.com/",
+        r"\blink\b",
+        r"\bfollow\b",
+        r"\bfollowers\b",
+        r"\bjoin\b",
+        r"\btelegram\b",
+        r"\bdiscord\b",
+        r"\bgiveaway\b",
+        r"\bpromo\b",
+        r"\bcommunity\b",
+        r"\bchannel\b",
+        r"\bgroup\b",
+        r"\bquote\b",
+        r"\bretweet\b",
+        r"\bchallenge\b",
+        r"\binspiring\b",
+    ]
+
+    return any(re.search(pattern, lower) for pattern in spam_patterns)
+
+
+def should_forward_post(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+
+    # Если это реклама/болтовня и не сигнал — не отправляем
+    if looks_like_spam_or_promo(text) and not looks_like_signal(text):
+        return False
+
+    # Если это вообще не сигнал — не отправляем
+    if not looks_like_signal(text):
+        return False
+
+    return True
+
+
+# =========================================================
 # SHARED CLEANUP
 # =========================================================
 
@@ -95,7 +176,7 @@ def basic_cleanup(text: str) -> str:
 
 
 # =========================================================
-# TELEGRAM TRANSFORM (как у тебя было)
+# TELEGRAM TRANSFORM
 # =========================================================
 
 def normalize_money_ranges(line: str) -> str:
@@ -383,6 +464,17 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if str(chat.id) != str(SOURCE_CHANNEL):
         log("Skip: not source channel")
+        return
+
+    # Сначала чистим общий текст для фильтра
+    filtered_base_text = basic_cleanup(raw_text)
+    if not filtered_base_text:
+        log("Skip: empty base text")
+        return
+
+    # Фильтр: если это не сигнал / это промо-мусор — не отправляем никуда
+    if not should_forward_post(filtered_base_text):
+        log("Skipped non-signal / promo post:\n", filtered_base_text)
         return
 
     # Telegram version
