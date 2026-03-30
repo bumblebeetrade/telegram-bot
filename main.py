@@ -56,7 +56,7 @@ def looks_like_signal(text: str) -> bool:
     lower = text.lower()
 
     signal_patterns = [
-        r"\$\w+",                 # $BTC, $ETH, etc.
+        r"\$\w+",                 # $BTC, $ETH, $SOL
         r"\blong\b",
         r"\bshort\b",
         r"\bdca\b",
@@ -86,7 +86,7 @@ def looks_like_spam_or_promo(text: str) -> bool:
     lower = text.lower()
 
     spam_patterns = [
-        r"@\w+",                  # mentions
+        r"@\w+",
         r"https?://",
         r"t\.me/",
         r"twitter\.com/",
@@ -115,11 +115,9 @@ def should_forward_post(text: str) -> bool:
     if not text or not text.strip():
         return False
 
-    # Если это реклама/болтовня и не сигнал — не отправляем
     if looks_like_spam_or_promo(text) and not looks_like_signal(text):
         return False
 
-    # Если это вообще не сигнал — не отправляем
     if not looks_like_signal(text):
         return False
 
@@ -158,6 +156,50 @@ def remove_urls(text: str) -> str:
     return re.sub(r"https?://\S+", "", text)
 
 
+def is_promo_line(line: str) -> bool:
+    low = line.lower().strip()
+
+    promo_patterns = [
+        r"you can copy my trades now\.?$",
+        r"steps\s*&\s*conditions\s*to\s*follow:?$",
+        r"signup\s*&\s*deposit.*$",
+        r"copy my trades.*$",
+        r"follow.*$",
+        r"join.*$",
+        r"telegram.*$",
+        r"discord.*$",
+        r"community.*$",
+        r"channel.*$",
+        r"group.*$",
+        r"link.*$",
+        r"giveaway.*$",
+        r"promo.*$",
+        r"partner.*$",
+        r"blofin.*$",
+    ]
+
+    return any(re.search(pattern, low, flags=re.IGNORECASE) for pattern in promo_patterns)
+
+
+def remove_promo_lines(text: str) -> str:
+    lines = [line.rstrip() for line in text.splitlines()]
+    cleaned = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        if not stripped:
+            cleaned.append("")
+            continue
+
+        if is_promo_line(stripped):
+            continue
+
+        cleaned.append(line)
+
+    return "\n".join(cleaned).strip()
+
+
 def cleanup_whitespace(text: str) -> str:
     text = html.unescape(text)
     text = text.replace("\r", "")
@@ -171,6 +213,7 @@ def basic_cleanup(text: str) -> str:
     text = remove_source_header(text)
     text = remove_footer_twitter_link(text)
     text = remove_urls(text)
+    text = remove_promo_lines(text)
     text = cleanup_whitespace(text)
     return text
 
@@ -371,7 +414,7 @@ def transform_ifttt_text_for_telegram(raw_text: str) -> Optional[str]:
 
 
 # =========================================================
-# DISCORD / PIPEDREAM TRANSFORM (без перевода)
+# DISCORD / PIPEDREAM TRANSFORM
 # =========================================================
 
 def transform_text_for_discord(raw_text: str) -> Optional[str]:
@@ -466,18 +509,15 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         log("Skip: not source channel")
         return
 
-    # Сначала чистим общий текст для фильтра
     filtered_base_text = basic_cleanup(raw_text)
     if not filtered_base_text:
         log("Skip: empty base text")
         return
 
-    # Фильтр: если это не сигнал / это промо-мусор — не отправляем никуда
     if not should_forward_post(filtered_base_text):
         log("Skipped non-signal / promo post:\n", filtered_base_text)
         return
 
-    # Telegram version
     tg_result = transform_ifttt_text_for_telegram(raw_text)
     if tg_result:
         log("Final Telegram text:\n", tg_result)
@@ -485,7 +525,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         log("Skip Telegram: empty result")
 
-    # Discord version through Pipedream
     dc_result = transform_text_for_discord(raw_text)
     if dc_result:
         log("Final Discord text:\n", dc_result)
