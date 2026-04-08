@@ -490,18 +490,34 @@ def send_to_pipedream_text(text: str):
     log("Sent text to Pipedream")
 
 
-def send_to_pipedream_photo(image_url: str, caption: str = ""):
+async def get_telegram_file_bytes(
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id: str
+) -> tuple[bytes, str]:
+    tg_file = await context.bot.get_file(file_id)
+
+    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
+    response = requests.get(file_url, timeout=30)
+    response.raise_for_status()
+
+    filename = tg_file.file_path.split("/")[-1] if tg_file.file_path else "photo.jpg"
+    return response.content, filename
+
+
+def send_to_pipedream_photo(image_bytes: bytes, filename: str, caption: str = ""):
     response = requests.post(
         PIPEDREAM_WEBHOOK_URL,
-        json={
+        data={
             "type": "photo",
-            "image_url": image_url,
-            "caption": caption,
+            "caption": caption or "",
         },
-        timeout=20,
+        files={
+            "file": (filename, image_bytes, "image/jpeg"),
+        },
+        timeout=60,
     )
     response.raise_for_status()
-    log("Sent photo to Pipedream")
+    log("Sent photo file to Pipedream")
 
 
 # =========================================================
@@ -542,15 +558,6 @@ async def send_to_target_photo(
 
 
 # =========================================================
-# HELPERS
-# =========================================================
-
-async def get_telegram_file_url(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> str:
-    tg_file = await context.bot.get_file(file_id)
-    return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
-
-
-# =========================================================
 # HANDLER
 # =========================================================
 
@@ -575,7 +582,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         cleaned_caption = basic_cleanup(raw_caption) if raw_caption else ""
 
-        # Если caption есть и он не сигнал — не отправляем фото
         if cleaned_caption and not should_forward_post(cleaned_caption):
             log("Skipped photo post because caption is non-signal / promo:\n", cleaned_caption)
             return
@@ -586,13 +592,11 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         largest_photo = msg.photo[-1]
         photo_file_id = largest_photo.file_id
 
-        # Telegram target
         await send_to_target_photo(context, photo_file_id, tg_caption or "")
 
-        # Pipedream / Discord
         try:
-            file_url = await get_telegram_file_url(context, photo_file_id)
-            send_to_pipedream_photo(file_url, dc_caption or "")
+            image_bytes, filename = await get_telegram_file_bytes(context, photo_file_id)
+            send_to_pipedream_photo(image_bytes, filename, dc_caption or "")
         except Exception as e:
             log("Pipedream photo send error:", str(e))
 
