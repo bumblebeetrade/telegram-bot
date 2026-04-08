@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import base64
 import requests
 from typing import Optional
 
@@ -46,85 +47,6 @@ def log(*args):
 
 
 # =========================================================
-# FILTERS
-# =========================================================
-
-def looks_like_signal(text: str) -> bool:
-    if not text:
-        return False
-
-    lower = text.lower()
-
-    signal_patterns = [
-        r"\$\w+",
-        r"\blong\b",
-        r"\bshort\b",
-        r"\bdca\b",
-        r"\bsl\b",
-        r"\btp\b",
-        r"\bentry\b",
-        r"\bstop\s*loss\b",
-        r"\btake\s*profit\b",
-        r"\bclosed?\b",
-        r"\btarget\b",
-        r"\bopen(ed)?\b",
-        r"\bavg\b",
-        r"\bscalp\b",
-        r"\bswing\b",
-        r"\bre-?entry\b",
-        r"\bbang on\b",
-        r"\bbang bang\b",
-    ]
-
-    return any(re.search(pattern, lower) for pattern in signal_patterns)
-
-
-def looks_like_spam_or_promo(text: str) -> bool:
-    if not text:
-        return True
-
-    lower = text.lower()
-
-    spam_patterns = [
-        r"@\w+",
-        r"https?://",
-        r"t\.me/",
-        r"twitter\.com/",
-        r"x\.com/",
-        r"\blink\b",
-        r"\bfollow\b",
-        r"\bfollowers\b",
-        r"\bjoin\b",
-        r"\btelegram\b",
-        r"\bdiscord\b",
-        r"\bgiveaway\b",
-        r"\bpromo\b",
-        r"\bcommunity\b",
-        r"\bchannel\b",
-        r"\bgroup\b",
-        r"\bquote\b",
-        r"\bretweet\b",
-        r"\bchallenge\b",
-        r"\binspiring\b",
-    ]
-
-    return any(re.search(pattern, lower) for pattern in spam_patterns)
-
-
-def should_forward_post(text: str) -> bool:
-    if not text or not text.strip():
-        return False
-
-    if looks_like_spam_or_promo(text) and not looks_like_signal(text):
-        return False
-
-    if not looks_like_signal(text):
-        return False
-
-    return True
-
-
-# =========================================================
 # SHARED CLEANUP
 # =========================================================
 
@@ -133,24 +55,18 @@ def remove_source_header(text: str) -> str:
     cleaned = []
 
     for i, line in enumerate(lines):
+        # убрать "🚀 Новый твит от ..."
         if i == 0 and re.match(r"^\s*🚀\s*Новый твит от\s+.+", line, flags=re.IGNORECASE):
             continue
-        cleaned.append(line)
 
-    return "\n".join(cleaned).strip()
-
-
-def remove_trading_challenge_header(text: str) -> str:
-    lines = [line.rstrip() for line in text.splitlines()]
-    cleaned = []
-
-    for i, line in enumerate(lines):
+        # убрать "150$-750$ trading challenge" / "250$-1250$ trading challenge"
         if i == 0 and re.match(
-            r"^\s*\d+(?:\.\d+)?\$?\s*[-–]\s*\d+(?:\.\d+)?\$?\s+trading\s+challenge\s*$",
+            r"^\s*\d+(?:\.\d+)?\$?\s*-\s*\d+(?:\.\d+)?\$?\s+trading\s+challenge\s*$",
             line,
             flags=re.IGNORECASE,
         ):
             continue
+
         cleaned.append(line)
 
     return "\n".join(cleaned).strip()
@@ -172,50 +88,6 @@ def remove_urls(text: str) -> str:
     return re.sub(r"https?://\S+", "", text)
 
 
-def is_promo_line(line: str) -> bool:
-    low = line.lower().strip()
-
-    promo_patterns = [
-        r"you can copy my trades now\.?$",
-        r"steps\s*&\s*conditions\s*to\s*follow:?$",
-        r"signup\s*&\s*deposit.*$",
-        r"copy my trades.*$",
-        r"follow.*$",
-        r"join.*$",
-        r"telegram.*$",
-        r"discord.*$",
-        r"community.*$",
-        r"channel.*$",
-        r"group.*$",
-        r"link.*$",
-        r"giveaway.*$",
-        r"promo.*$",
-        r"partner.*$",
-        r"blofin.*$",
-    ]
-
-    return any(re.search(pattern, low, flags=re.IGNORECASE) for pattern in promo_patterns)
-
-
-def remove_promo_lines(text: str) -> str:
-    lines = [line.rstrip() for line in text.splitlines()]
-    cleaned = []
-
-    for line in lines:
-        stripped = line.strip()
-
-        if not stripped:
-            cleaned.append("")
-            continue
-
-        if is_promo_line(stripped):
-            continue
-
-        cleaned.append(line)
-
-    return "\n".join(cleaned).strip()
-
-
 def cleanup_whitespace(text: str) -> str:
     text = html.unescape(text)
     text = text.replace("\r", "")
@@ -225,12 +97,67 @@ def cleanup_whitespace(text: str) -> str:
     return text.strip()
 
 
+def should_drop_line(line: str) -> bool:
+    low = line.lower().strip()
+
+    ad_patterns = [
+        "you can copy my trades now",
+        "copy my trades now",
+        "steps & conditions to follow",
+        "steps and conditions to follow",
+        "signup & deposit",
+        "sign up & deposit",
+        "sign up and deposit",
+        "signup and deposit",
+        "copy my trades",
+        "copy trade",
+        "partner.",
+        "blofin",
+        "join my",
+        "telegram link",
+        "announce giveaway",
+        "followers left",
+        "free telegram link",
+        "send my budd",
+    ]
+
+    mention_patterns = [
+        "@crypto_zipsy",
+        "@crypto_arki",
+    ]
+
+    if any(p in low for p in ad_patterns):
+        return True
+
+    if any(p in low for p in mention_patterns):
+        return True
+
+    if low.startswith("→ signup"):
+        return True
+
+    if low.startswith("→ copy"):
+        return True
+
+    return False
+
+
+def remove_unwanted_lines(text: str) -> str:
+    lines = [line.rstrip() for line in text.splitlines()]
+    cleaned = []
+
+    for line in lines:
+        if should_drop_line(line):
+            continue
+        cleaned.append(line)
+
+    return "\n".join(cleaned).strip()
+
+
 def basic_cleanup(text: str) -> str:
     text = remove_source_header(text)
-    text = remove_trading_challenge_header(text)
     text = remove_footer_twitter_link(text)
     text = remove_urls(text)
-    text = remove_promo_lines(text)
+    text = remove_unwanted_lines(text)
     text = cleanup_whitespace(text)
     return text
 
@@ -431,14 +358,13 @@ def transform_ifttt_text_for_telegram(raw_text: str) -> Optional[str]:
 
 
 # =========================================================
-# DISCORD / PIPEDREAM TRANSFORM
+# DISCORD TRANSFORM
 # =========================================================
 
 def transform_text_for_discord(raw_text: str) -> Optional[str]:
     text = basic_cleanup(raw_text)
     if not text:
         return None
-
     return text or None
 
 
@@ -482,46 +408,37 @@ def send_to_pipedream_text(text: str):
     for part in parts:
         response = requests.post(
             PIPEDREAM_WEBHOOK_URL,
-            json={"type": "text", "text": part},
-            timeout=20,
+            json={
+                "type": "text",
+                "text": part,
+            },
+            timeout=30,
         )
         response.raise_for_status()
 
     log("Sent text to Pipedream")
 
 
-async def get_telegram_file_bytes(
-    context: ContextTypes.DEFAULT_TYPE,
-    file_id: str
-) -> tuple[bytes, str]:
-    tg_file = await context.bot.get_file(file_id)
+def send_to_pipedream_photo(caption: str, image_bytes: bytes, filename: str = "photo.jpg"):
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
 
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
-    response = requests.get(file_url, timeout=30)
-    response.raise_for_status()
-
-    filename = tg_file.file_path.split("/")[-1] if tg_file.file_path else "photo.jpg"
-    return response.content, filename
-
-
-def send_to_pipedream_photo(image_bytes: bytes, filename: str, caption: str = ""):
     response = requests.post(
         PIPEDREAM_WEBHOOK_URL,
-        data={
+        json={
             "type": "photo",
-            "caption": caption or "",
-        },
-        files={
-            "file": (filename, image_bytes, "image/jpeg"),
+            "caption": caption,
+            "filename": filename,
+            "image_base64": encoded,
         },
         timeout=60,
     )
     response.raise_for_status()
-    log("Sent photo file to Pipedream")
+
+    log("Sent photo to Pipedream")
 
 
 # =========================================================
-# SENDERS
+# TELEGRAM SENDERS
 # =========================================================
 
 async def send_to_target_text(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -540,18 +457,16 @@ async def send_to_target_text(context: ContextTypes.DEFAULT_TYPE, text: str) -> 
 async def send_to_target_photo(
     context: ContextTypes.DEFAULT_TYPE,
     photo_file_id: str,
-    caption: str = ""
+    caption: Optional[str] = None,
 ) -> None:
     kwargs = {
         "chat_id": TARGET_CHAT_ID,
         "message_thread_id": TARGET_MESSAGE_THREAD_ID,
         "photo": photo_file_id,
-        "disable_notification": False,
     }
 
     if caption:
         kwargs["caption"] = caption
-        kwargs["parse_mode"] = ParseMode.HTML
 
     await context.bot.send_photo(**kwargs)
     log("Sent photo to Telegram target")
@@ -567,74 +482,60 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     chat = msg.chat
+    raw_text = msg.text or msg.caption or ""
+
+    log("Incoming channel:", chat.id, "|", chat.title)
+    log("Raw text:\n", raw_text)
 
     if str(chat.id) != str(SOURCE_CHANNEL):
         log("Skip: not source channel")
         return
 
     # =====================================================
-    # PHOTO POSTS
+    # TELEGRAM TARGET
     # =====================================================
-    if msg.photo:
-        raw_caption = msg.caption or ""
-        log("Incoming photo post from:", chat.id, "|", chat.title)
-        log("Raw caption:\n", raw_caption)
-
-        cleaned_caption = basic_cleanup(raw_caption) if raw_caption else ""
-
-        if cleaned_caption and not should_forward_post(cleaned_caption):
-            log("Skipped photo post because caption is non-signal / promo:\n", cleaned_caption)
-            return
-
-        tg_caption = transform_ifttt_text_for_telegram(raw_caption) if raw_caption else ""
-        dc_caption = transform_text_for_discord(raw_caption) if raw_caption else ""
-
-        largest_photo = msg.photo[-1]
-        photo_file_id = largest_photo.file_id
-
-        await send_to_target_photo(context, photo_file_id, tg_caption or "")
-
-        try:
-            image_bytes, filename = await get_telegram_file_bytes(context, photo_file_id)
-            send_to_pipedream_photo(image_bytes, filename, dc_caption or "")
-        except Exception as e:
-            log("Pipedream photo send error:", str(e))
-
-        return
-
-    # =====================================================
-    # TEXT POSTS
-    # =====================================================
-    raw_text = msg.text or msg.caption or ""
-
-    log("Incoming text channel post:", chat.id, "|", chat.title)
-    log("Raw text:\n", raw_text)
-
-    filtered_base_text = basic_cleanup(raw_text)
-    if not filtered_base_text:
-        log("Skip: empty base text")
-        return
-
-    if not should_forward_post(filtered_base_text):
-        log("Skipped non-signal / promo post:\n", filtered_base_text)
-        return
 
     tg_result = transform_ifttt_text_for_telegram(raw_text)
-    if tg_result:
-        log("Final Telegram text:\n", tg_result)
-        await send_to_target_text(context, tg_result)
-    else:
-        log("Skip Telegram: empty result")
 
-    dc_result = transform_text_for_discord(raw_text)
-    if dc_result:
-        log("Final Discord text:\n", dc_result)
-        try:
-            send_to_pipedream_text(dc_result)
-        except Exception as e:
-            log("Pipedream text send error:", str(e))
+    if msg.photo:
+        largest_photo = msg.photo[-1]
+        if tg_result:
+            await send_to_target_photo(context, largest_photo.file_id, tg_result)
+        else:
+            await send_to_target_photo(context, largest_photo.file_id, None)
     else:
-        log("Skip Discord: empty result")
+        if tg_result:
+            await send_to_target_text(context, tg_result)
+        else:
+            log("Skip Telegram: empty result")
+
+    # =====================================================
+    # DISCORD / PIPEDREAM
+    # =====================================================
+
+    try:
+        dc_result = transform_text_for_discord(raw_text) or ""
+
+        if msg.photo:
+            largest_photo = msg.photo[-1]
+            tg_file = await context.bot.get_file(largest_photo.file_id)
+
+            file_response = requests.get(tg_file.file_path, timeout=60)
+            file_response.raise_for_status()
+
+            send_to_pipedream_photo(
+                caption=dc_result,
+                image_bytes=file_response.content,
+                filename="photo.jpg",
+            )
+        else:
+            if dc_result:
+                send_to_pipedream_text(dc_result)
+            else:
+                log("Skip Discord: empty result")
+
+    except Exception as e:
+        log("Pipedream send error:", str(e))
 
 
 # =========================================================
