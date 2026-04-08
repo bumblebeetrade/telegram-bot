@@ -56,7 +56,7 @@ def looks_like_signal(text: str) -> bool:
     lower = text.lower()
 
     signal_patterns = [
-        r"\$\w+",                 # $BTC, $ETH, $SOL
+        r"\$\w+",
         r"\blong\b",
         r"\bshort\b",
         r"\bdca\b",
@@ -140,6 +140,22 @@ def remove_source_header(text: str) -> str:
     return "\n".join(cleaned).strip()
 
 
+def remove_trading_challenge_header(text: str) -> str:
+    lines = [line.rstrip() for line in text.splitlines()]
+    cleaned = []
+
+    for i, line in enumerate(lines):
+        if i == 0 and re.match(
+            r"^\s*\d+(?:\.\d+)?\$?\s*[-–]\s*\d+(?:\.\d+)?\$?\s+trading\s+challenge\s*$",
+            line,
+            flags=re.IGNORECASE,
+        ):
+            continue
+        cleaned.append(line)
+
+    return "\n".join(cleaned).strip()
+
+
 def remove_footer_twitter_link(text: str) -> str:
     lines = [line.rstrip() for line in text.splitlines()]
     cleaned = []
@@ -211,6 +227,7 @@ def cleanup_whitespace(text: str) -> str:
 
 def basic_cleanup(text: str) -> str:
     text = remove_source_header(text)
+    text = remove_trading_challenge_header(text)
     text = remove_footer_twitter_link(text)
     text = remove_urls(text)
     text = remove_promo_lines(text)
@@ -459,25 +476,39 @@ def split_text(text: str, limit: int = 1900) -> list[str]:
     return parts
 
 
-def send_to_pipedream(text: str):
+def send_to_pipedream_text(text: str):
     parts = split_text(text)
 
     for part in parts:
         response = requests.post(
             PIPEDREAM_WEBHOOK_URL,
-            json={"text": part},
+            json={"type": "text", "text": part},
             timeout=20,
         )
         response.raise_for_status()
 
-    log("Sent to Pipedream")
+    log("Sent text to Pipedream")
+
+
+def send_to_pipedream_photo(image_url: str, caption: str = ""):
+    response = requests.post(
+        PIPEDREAM_WEBHOOK_URL,
+        json={
+            "type": "photo",
+            "image_url": image_url,
+            "caption": caption,
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    log("Sent photo to Pipedream")
 
 
 # =========================================================
 # SENDERS
 # =========================================================
 
-async def send_to_target(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+async def send_to_target_text(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     kwargs = {
         "chat_id": TARGET_CHAT_ID,
         "message_thread_id": TARGET_MESSAGE_THREAD_ID,
@@ -487,7 +518,36 @@ async def send_to_target(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     }
 
     await context.bot.send_message(**kwargs)
-    log("Sent message to Telegram target")
+    log("Sent text to Telegram target")
+
+
+async def send_to_target_photo(
+    context: ContextTypes.DEFAULT_TYPE,
+    photo_file_id: str,
+    caption: str = ""
+) -> None:
+    kwargs = {
+        "chat_id": TARGET_CHAT_ID,
+        "message_thread_id": TARGET_MESSAGE_THREAD_ID,
+        "photo": photo_file_id,
+        "disable_notification": False,
+    }
+
+    if caption:
+        kwargs["caption"] = caption
+        kwargs["parse_mode"] = ParseMode.HTML
+
+    await context.bot.send_photo(**kwargs)
+    log("Sent photo to Telegram target")
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+async def get_telegram_file_url(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> str:
+    tg_file = await context.bot.get_file(file_id)
+    return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
 
 
 # =========================================================
@@ -500,14 +560,51 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     chat = msg.chat
-    raw_text = msg.text or msg.caption or ""
-
-    log("Incoming channel:", chat.id, "|", chat.title)
-    log("Raw text:\n", raw_text)
 
     if str(chat.id) != str(SOURCE_CHANNEL):
         log("Skip: not source channel")
         return
+
+    # =====================================================
+    # PHOTO POSTS
+    # =====================================================
+    if msg.photo:
+        raw_caption = msg.caption or ""
+        log("Incoming photo post from:", chat.id, "|", chat.title)
+        log("Raw caption:\n", raw_caption)
+
+        cleaned_caption = basic_cleanup(raw_caption) if raw_caption else ""
+
+        # Если caption есть и он не сигнал — не отправляем фото
+        if cleaned_caption and not should_forward_post(cleaned_caption):
+            log("Skipped photo post because caption is non-signal / promo:\n", cleaned_caption)
+            return
+
+        tg_caption = transform_ifttt_text_for_telegram(raw_caption) if raw_caption else ""
+        dc_caption = transform_text_for_discord(raw_caption) if raw_caption else ""
+
+        largest_photo = msg.photo[-1]
+        photo_file_id = largest_photo.file_id
+
+        # Telegram target
+        await send_to_target_photo(context, photo_file_id, tg_caption or "")
+
+        # Pipedream / Discord
+        try:
+            file_url = await get_telegram_file_url(context, photo_file_id)
+            send_to_pipedream_photo(file_url, dc_caption or "")
+        except Exception as e:
+            log("Pipedream photo send error:", str(e))
+
+        return
+
+    # =====================================================
+    # TEXT POSTS
+    # =====================================================
+    raw_text = msg.text or msg.caption or ""
+
+    log("Incoming text channel post:", chat.id, "|", chat.title)
+    log("Raw text:\n", raw_text)
 
     filtered_base_text = basic_cleanup(raw_text)
     if not filtered_base_text:
@@ -521,7 +618,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     tg_result = transform_ifttt_text_for_telegram(raw_text)
     if tg_result:
         log("Final Telegram text:\n", tg_result)
-        await send_to_target(context, tg_result)
+        await send_to_target_text(context, tg_result)
     else:
         log("Skip Telegram: empty result")
 
@@ -529,9 +626,9 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     if dc_result:
         log("Final Discord text:\n", dc_result)
         try:
-            send_to_pipedream(dc_result)
+            send_to_pipedream_text(dc_result)
         except Exception as e:
-            log("Pipedream send error:", str(e))
+            log("Pipedream text send error:", str(e))
     else:
         log("Skip Discord: empty result")
 
