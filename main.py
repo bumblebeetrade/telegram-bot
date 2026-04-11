@@ -24,7 +24,6 @@ TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 TARGET_MESSAGE_THREAD_ID = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0"))
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
 
-# Pipedream webhook URL
 PIPEDREAM_WEBHOOK_URL = "https://eon5ixlgvwu4zqi.m.pipedream.net"
 
 # =========================================================
@@ -47,8 +46,17 @@ def log(*args):
 
 
 # =========================================================
-# SHARED CLEANUP
+# CLEANUP HELPERS
 # =========================================================
+
+def cleanup_whitespace(text: str) -> str:
+    text = html.unescape(text)
+    text = text.replace("\r", "")
+    text = "\n".join(line.strip() for line in text.splitlines())
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
 
 def remove_source_header(text: str) -> str:
     lines = [line.rstrip() for line in text.splitlines()]
@@ -58,15 +66,6 @@ def remove_source_header(text: str) -> str:
         # убрать "🚀 Новый твит от ..."
         if i == 0 and re.match(r"^\s*🚀\s*Новый твит от\s+.+", line, flags=re.IGNORECASE):
             continue
-
-        # убрать "150$-750$ trading challenge" / "250$-1250$ trading challenge"
-        if i == 0 and re.match(
-            r"^\s*\d+(?:\.\d+)?\$?\s*-\s*\d+(?:\.\d+)?\$?\s+trading\s+challenge\s*$",
-            line,
-            flags=re.IGNORECASE,
-        ):
-            continue
-
         cleaned.append(line)
 
     return "\n".join(cleaned).strip()
@@ -88,18 +87,49 @@ def remove_urls(text: str) -> str:
     return re.sub(r"https?://\S+", "", text)
 
 
-def cleanup_whitespace(text: str) -> str:
-    text = html.unescape(text)
-    text = text.replace("\r", "")
-    text = "\n".join(line.strip() for line in text.splitlines())
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    return text.strip()
+def is_top_trading_challenge_line(line: str) -> bool:
+    """
+    Удаляем только чистую первую строку формата:
+    150$-750$ trading challenge
+    250-1250$ trading challenge
+    и т.п.
+
+    Но НЕ удаляем:
+    250$-1250$ trading challenge completed
+    """
+    low = line.strip().lower()
+
+    if "completed" in low:
+        return False
+
+    pattern = r"""
+        ^\s*
+        \d+(?:\.\d+)?\$?\s*-\s*\d+(?:\.\d+)?\$?
+        \s+trading\s+challenge
+        \s*$
+    """
+    return re.match(pattern, line, flags=re.IGNORECASE | re.VERBOSE) is not None
 
 
-def should_drop_line(line: str) -> bool:
+def line_has_mention(line: str) -> bool:
+    return re.search(r"(^|\s)@[A-Za-z0-9_]{2,}", line) is not None
+
+
+def should_drop_line(line: str, index: int) -> bool:
     low = line.lower().strip()
 
+    if not low:
+        return False
+
+    # Любые упоминания в любой строке — удаляем
+    if line_has_mention(line):
+        return True
+
+    # Верхняя строка "150$-750$ trading challenge" — удаляем
+    if index == 0 and is_top_trading_challenge_line(line):
+        return True
+
+    # Явная реклама / мусор
     ad_patterns = [
         "you can copy my trades now",
         "copy my trades now",
@@ -111,25 +141,22 @@ def should_drop_line(line: str) -> bool:
         "signup and deposit",
         "copy my trades",
         "copy trade",
+        "join telegram in bio",
+        "join telegram",
+        "telegram in bio",
+        "bio for quick notifications",
+        "quick notifications",
+        "free telegram link",
+        "another free telegram link",
+        "thanks for supporting",
+        "followers left",
+        "announce giveaway",
+        "send my budd",
         "partner.",
         "blofin",
-        "join my",
-        "telegram link",
-        "announce giveaway",
-        "followers left",
-        "free telegram link",
-        "send my budd",
-    ]
-
-    mention_patterns = [
-        "@crypto_zipsy",
-        "@crypto_arki",
     ]
 
     if any(p in low for p in ad_patterns):
-        return True
-
-    if any(p in low for p in mention_patterns):
         return True
 
     if low.startswith("→ signup"):
@@ -145,8 +172,8 @@ def remove_unwanted_lines(text: str) -> str:
     lines = [line.rstrip() for line in text.splitlines()]
     cleaned = []
 
-    for line in lines:
-        if should_drop_line(line):
+    for i, line in enumerate(lines):
+        if should_drop_line(line, i):
             continue
         cleaned.append(line)
 
@@ -207,6 +234,12 @@ def normalize_closed(line: str) -> str:
         line,
     )
 
+    line = re.sub(
+        r"(?i)\bclosing\s+(\$\w+)\s+(long|short)\s+at\s+([0-9]+(?:\.\d+)?)",
+        lambda m: f"Закрываю {m.group(1).upper()} {m.group(2).lower()} по {m.group(3)}",
+        line,
+    )
+
     return line
 
 
@@ -220,6 +253,7 @@ def normalize_dca(line: str) -> str:
 
 def normalize_sl_tp(line: str) -> str:
     line = re.sub(r"(?i)\bsl\s*[:\-]?\s*([^\n]+)", r"Стоп: \1", line)
+    line = re.sub(r"(?i)\bstops?\s*[:\-]?\s*([^\n]+)", r"Стоп: \1", line)
     line = re.sub(r"(?i)\btp\s*[:\-]?\s*([^\n]+)", r"Тейк: \1", line)
     return line
 
@@ -262,6 +296,12 @@ def normalize_progress(line: str) -> str:
         line,
     )
 
+    line = re.sub(
+        r"(?i)\banother\s+(\d+)x\s+done\b",
+        r"Ещё x\1 сделано",
+        line,
+    )
+
     return line
 
 
@@ -271,6 +311,7 @@ def is_service_line(line: str) -> bool:
     service_patterns = [
         "closed for",
         "closed at",
+        "closing ",
         "total balance",
         "total balance left",
         "1st dca",
@@ -278,10 +319,12 @@ def is_service_line(line: str) -> bool:
         "3rd dca",
         "4th dca",
         "sl",
+        "stops",
         "tp",
         "lost",
         "gained",
         "nearly done",
+        "another 5x done",
         "crazy gains",
         "big gains",
         "nice gains",
