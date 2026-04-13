@@ -63,7 +63,6 @@ def remove_source_header(text: str) -> str:
     cleaned = []
 
     for i, line in enumerate(lines):
-        # убрать "🚀 Новый твит от ..."
         if i == 0 and re.match(r"^\s*🚀\s*Новый твит от\s+.+", line, flags=re.IGNORECASE):
             continue
         cleaned.append(line)
@@ -89,10 +88,9 @@ def remove_urls(text: str) -> str:
 
 def is_top_trading_challenge_line(line: str) -> bool:
     """
-    Удаляем только чистую первую строку формата:
+    Удаляем только чистую верхнюю строку формата:
     150$-750$ trading challenge
     250-1250$ trading challenge
-    и т.п.
 
     Но НЕ удаляем:
     250$-1250$ trading challenge completed
@@ -129,8 +127,8 @@ def should_drop_line(line: str, index: int) -> bool:
     if index == 0 and is_top_trading_challenge_line(line):
         return True
 
-    # Явная реклама / мусор
     ad_patterns = [
+        # copy / promo
         "you can copy my trades now",
         "copy my trades now",
         "steps & conditions to follow",
@@ -141,24 +139,86 @@ def should_drop_line(line: str, index: int) -> bool:
         "signup and deposit",
         "copy my trades",
         "copy trade",
-        "join telegram in bio",
-        "join telegram",
-        "telegram in bio",
+        "free group",
+        "paid/free group",
+        "share live trades",
+        "live trades no paid/free group",
+
+        # dm / bio / notifications
+        "dm first",
+        "never dm first",
         "bio for quick notifications",
         "quick notifications",
-        "free telegram link",
-        "another free telegram link",
+        "telegram in bio",
+        "twitter in bio",
+        "x in bio",
+
+        # giveaway / followers / support
         "thanks for supporting",
         "followers left",
         "announce giveaway",
         "send my budd",
+
+        # known ad leftovers
         "partner.",
         "blofin",
+
+        # telegram promo
+        "join fast my telegram channel",
+        "join fast telegram channel",
+        "join my telegram channel",
+        "join our telegram channel",
+        "join my telegram group",
+        "join our telegram group",
+        "join telegram channel",
+        "join telegram group",
+        "join fast my telegram group",
+        "my telegram channel",
+        "my telegram group",
+        "telegram channel",
+        "telegram group",
+        "free telegram link",
+        "another free telegram link",
+        "join telegram in bio",
+
+        # twitter / x promo
+        "join my twitter",
+        "join our twitter",
+        "follow my twitter",
+        "follow our twitter",
+        "follow me on twitter",
+        "follow me on x",
+        "follow my x",
+        "follow our x",
+        "join my x",
+        "join our x",
+        "twitter channel",
+        "twitter group",
+        "x channel",
+        "x group",
+        "join fast my twitter",
+        "join fast my x",
+        "follow on twitter",
+        "follow on x",
+        "twitter link in bio",
+        "x link in bio",
     ]
 
     if any(p in low for p in ad_patterns):
         return True
 
+    # универсально режем telegram-рекламу
+    if "telegram" in low and ("join" in low or "channel" in low or "group" in low or "bio" in low):
+        return True
+
+    # универсально режем twitter/x-рекламу
+    if "twitter" in low and ("join" in low or "follow" in low or "channel" in low or "group" in low or "bio" in low):
+        return True
+
+    if re.search(r"\bx\b", low) and ("follow" in low or "join" in low) and ("bio" in low or "channel" in low or "group" in low):
+        return True
+
+    # ещё один явный мусор
     if low.startswith("→ signup"):
         return True
 
