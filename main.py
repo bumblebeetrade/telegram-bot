@@ -1,8 +1,12 @@
 import os
 import re
 import html
+import json
 import requests
+from io import BytesIO
 from typing import Optional
+
+from PIL import Image, ImageFilter
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -23,6 +27,9 @@ TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 TARGET_MESSAGE_THREAD_ID = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0"))
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
+
+# Файл фона для стилизации Discord-изображений
+DISCORD_BG_PATH = "discord_bg.png"
 
 # =========================================================
 
@@ -179,6 +186,10 @@ def should_drop_line(line: str, index: int) -> bool:
         "follow on x",
         "twitter link in bio",
         "x link in bio",
+        "join fast my telegram channel",
+        "join fast my telegram group",
+        "join fast my twitter channel",
+        "join fast my x channel",
     ]
 
     if any(p in low for p in ad_patterns):
@@ -493,15 +504,68 @@ def send_discord_text(text: str):
     log("Sent text to Discord")
 
 
-def send_discord_photo(caption: str, image_bytes: bytes, filename: str = "photo.jpg"):
+def _build_background_mask(original_rgba: Image.Image) -> Image.Image:
+    """
+    Маска фона:
+    - ловим светлый/сероватый фон
+    - стараемся не трогать тёмный текст, цифры, иконки
+    - немного смягчаем границы
+    """
+    rgb = original_rgba.convert("RGB")
+    width, height = rgb.size
+    mask = Image.new("L", (width, height))
+    src = rgb.load()
+    dst = mask.load()
+
+    for y in range(height):
+        for x in range(width):
+            r, g, b = src[x, y]
+
+            brightness = (r + g + b) / 3.0
+            spread = max(r, g, b) - min(r, g, b)
+
+            # Светлый, слабонасыщенный фон
+            # Это хорошо подходит под твои бело-серые оригиналы
+            if brightness >= 180 and spread <= 45:
+                # Чем светлее, тем сильнее заменяем
+                strength = int(min(255, max(0, (brightness - 180) * 3.2)))
+                dst[x, y] = strength
+            else:
+                dst[x, y] = 0
+
+    # Смягчаем края, чтобы картинка выглядела естественнее
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=1.6))
+    return mask
+
+
+def stylize_discord_image(image_bytes: bytes) -> bytes:
+    """
+    Меняет только фон под Discord-стиль.
+    Если что-то пойдёт не так, снаружи есть fallback на оригинал.
+    """
+    original = Image.open(BytesIO(image_bytes)).convert("RGBA")
+    background = Image.open(DISCORD_BG_PATH).convert("RGBA").resize(original.size)
+
+    mask = _build_background_mask(original)
+
+    # Смешиваем оригинал с фоном только в зонах фона
+    styled = Image.composite(background, original, mask)
+
+    # Сохраняем результат
+    output = BytesIO()
+    styled.save(output, format="PNG")
+    output.seek(0)
+    return output.getvalue()
+
+
+def send_discord_photo(caption: str, image_bytes: bytes, filename: str = "photo.png"):
+    payload = {"content": caption or ""}
     data = {
-        "payload_json": html.unescape(
-            __import__("json").dumps({"content": caption or ""}, ensure_ascii=False)
-        )
+        "payload_json": json.dumps(payload, ensure_ascii=False)
     }
 
     files = {
-        "files[0]": (filename, image_bytes, "image/jpeg")
+        "files[0]": (filename, image_bytes, "image/png")
     }
 
     response = requests.post(
@@ -569,6 +633,10 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         log("Skip: not source channel")
         return
 
+    # =====================================================
+    # TELEGRAM TARGET
+    # =====================================================
+
     tg_result = transform_ifttt_text_for_telegram(raw_text)
 
     if msg.photo:
@@ -583,6 +651,10 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             log("Skip Telegram: empty result")
 
+    # =====================================================
+    # DISCORD TARGET
+    # =====================================================
+
     try:
         dc_result = transform_text_for_discord(raw_text) or ""
 
@@ -593,11 +665,26 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             file_response = requests.get(tg_file.file_path, timeout=60)
             file_response.raise_for_status()
 
-            send_discord_photo(
-                caption=dc_result,
-                image_bytes=file_response.content,
-                filename="photo.jpg",
-            )
+            original_bytes = file_response.content
+
+            # Сначала пытаемся стилизовать.
+            # Если не получится — отправим оригинал.
+            try:
+                styled_bytes = stylize_discord_image(original_bytes)
+                send_discord_photo(
+                    caption=dc_result,
+                    image_bytes=styled_bytes,
+                    filename="styled.png",
+                )
+                log("Sent styled photo to Discord")
+            except Exception as style_error:
+                log("Stylization failed, fallback to original:", str(style_error))
+                send_discord_photo(
+                    caption=dc_result,
+                    image_bytes=original_bytes,
+                    filename="original.png",
+                )
+
         else:
             if dc_result:
                 send_discord_text(dc_result)
