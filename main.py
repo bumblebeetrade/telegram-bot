@@ -6,7 +6,7 @@ import requests
 from io import BytesIO
 from typing import Optional
 
-from PIL import Image, ImageFilter
+from PIL import Image
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -507,7 +507,7 @@ def _build_background_mask(original_rgba: Image.Image) -> Image.Image:
     rgb = original_rgba.convert("RGB")
     width, height = rgb.size
 
-    mask = Image.new("L", (width, height))
+    mask = Image.new("L", (width, height), 0)
     src = rgb.load()
     dst = mask.load()
 
@@ -518,12 +518,13 @@ def _build_background_mask(original_rgba: Image.Image) -> Image.Image:
             brightness = (r + g + b) / 3
             spread = max(r, g, b) - min(r, g, b)
 
-            if brightness > 210 and spread < 25:
+            # Очень жёстко ловим только настоящий светлый фон.
+            # Это должно меньше задевать текст, цифры и кнопки.
+            if brightness >= 238 and spread <= 18:
                 dst[x, y] = 255
             else:
                 dst[x, y] = 0
 
-    mask = mask.filter(ImageFilter.GaussianBlur(radius=0.8))
     return mask
 
 
