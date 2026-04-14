@@ -5,6 +5,7 @@ import json
 import requests
 from io import BytesIO
 from typing import Optional
+from collections import deque
 
 from PIL import Image
 
@@ -503,27 +504,58 @@ def send_discord_text(text: str):
     log("Sent text to Discord")
 
 
+def _is_background_candidate(r: int, g: int, b: int) -> bool:
+    brightness = (r + g + b) / 3
+    spread = max(r, g, b) - min(r, g, b)
+
+    # Светло-серый/белый фон оригинальных скринов
+    return brightness >= 232 and spread <= 22
+
+
 def _build_background_mask(original_rgba: Image.Image) -> Image.Image:
+    """
+    Ищем фон не по всему изображению, а flood fill от границ.
+    Так мы заменяем только настоящий фон, а не белые/серые буквы и кнопки внутри UI.
+    """
     rgb = original_rgba.convert("RGB")
     width, height = rgb.size
+    pixels = rgb.load()
 
+    visited = [[False] * width for _ in range(height)]
     mask = Image.new("L", (width, height), 0)
-    src = rgb.load()
-    dst = mask.load()
+    mask_px = mask.load()
 
+    q = deque()
+
+    # Стартуем только с рамки изображения
+    for x in range(width):
+        q.append((x, 0))
+        q.append((x, height - 1))
     for y in range(height):
-        for x in range(width):
-            r, g, b = src[x, y]
+        q.append((0, y))
+        q.append((width - 1, y))
 
-            brightness = (r + g + b) / 3
-            spread = max(r, g, b) - min(r, g, b)
+    while q:
+        x, y = q.popleft()
 
-            # Очень жёстко ловим только настоящий светлый фон.
-            # Это должно меньше задевать текст, цифры и кнопки.
-            if brightness >= 238 and spread <= 18:
-                dst[x, y] = 255
-            else:
-                dst[x, y] = 0
+        if x < 0 or y < 0 or x >= width or y >= height:
+            continue
+        if visited[y][x]:
+            continue
+
+        visited[y][x] = True
+
+        r, g, b = pixels[x, y]
+
+        if not _is_background_candidate(r, g, b):
+            continue
+
+        mask_px[x, y] = 255
+
+        q.append((x + 1, y))
+        q.append((x - 1, y))
+        q.append((x, y + 1))
+        q.append((x, y - 1))
 
     return mask
 
