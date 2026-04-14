@@ -1,7 +1,6 @@
 import os
 import re
 import html
-import base64
 import requests
 from typing import Optional
 
@@ -22,9 +21,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 SOURCE_CHANNEL = int(os.getenv("SOURCE_CHANNEL", "0"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 TARGET_MESSAGE_THREAD_ID = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0"))
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
-
-PIPEDREAM_WEBHOOK_URL = "https://eon5ixlgvwu4zqi.m.pipedream.net"
 
 # =========================================================
 
@@ -36,8 +34,8 @@ def validate_env():
         raise ValueError("SOURCE_CHANNEL is not set")
     if TARGET_CHAT_ID == 0:
         raise ValueError("TARGET_CHAT_ID is not set")
-    if not PIPEDREAM_WEBHOOK_URL:
-        raise ValueError("PIPEDREAM_WEBHOOK_URL is not set")
+    if not DISCORD_WEBHOOK_URL:
+        raise ValueError("DISCORD_WEBHOOK_URL is not set")
 
 
 def log(*args):
@@ -87,14 +85,6 @@ def remove_urls(text: str) -> str:
 
 
 def is_top_trading_challenge_line(line: str) -> bool:
-    """
-    Удаляем только чистую верхнюю строку формата:
-    150$-750$ trading challenge
-    250-1250$ trading challenge
-
-    Но НЕ удаляем:
-    250$-1250$ trading challenge completed
-    """
     low = line.strip().lower()
 
     if "completed" in low:
@@ -119,16 +109,13 @@ def should_drop_line(line: str, index: int) -> bool:
     if not low:
         return False
 
-    # Любые упоминания в любой строке — удаляем
     if line_has_mention(line):
         return True
 
-    # Верхняя строка "150$-750$ trading challenge" — удаляем
     if index == 0 and is_top_trading_challenge_line(line):
         return True
 
     ad_patterns = [
-        # copy / promo
         "you can copy my trades now",
         "copy my trades now",
         "steps & conditions to follow",
@@ -143,8 +130,6 @@ def should_drop_line(line: str, index: int) -> bool:
         "paid/free group",
         "share live trades",
         "live trades no paid/free group",
-
-        # dm / bio / notifications
         "dm first",
         "never dm first",
         "bio for quick notifications",
@@ -152,18 +137,12 @@ def should_drop_line(line: str, index: int) -> bool:
         "telegram in bio",
         "twitter in bio",
         "x in bio",
-
-        # giveaway / followers / support
         "thanks for supporting",
         "followers left",
         "announce giveaway",
         "send my budd",
-
-        # known ad leftovers
         "partner.",
         "blofin",
-
-        # telegram promo
         "join fast my telegram channel",
         "join fast telegram channel",
         "join my telegram channel",
@@ -180,8 +159,6 @@ def should_drop_line(line: str, index: int) -> bool:
         "free telegram link",
         "another free telegram link",
         "join telegram in bio",
-
-        # twitter / x promo
         "join my twitter",
         "join our twitter",
         "follow my twitter",
@@ -207,18 +184,15 @@ def should_drop_line(line: str, index: int) -> bool:
     if any(p in low for p in ad_patterns):
         return True
 
-    # универсально режем telegram-рекламу
     if "telegram" in low and ("join" in low or "channel" in low or "group" in low or "bio" in low):
         return True
 
-    # универсально режем twitter/x-рекламу
     if "twitter" in low and ("join" in low or "follow" in low or "channel" in low or "group" in low or "bio" in low):
         return True
 
     if re.search(r"\bx\b", low) and ("follow" in low or "join" in low) and ("bio" in low or "channel" in low or "group" in low):
         return True
 
-    # ещё один явный мусор
     if low.startswith("→ signup"):
         return True
 
@@ -461,7 +435,7 @@ def transform_ifttt_text_for_telegram(raw_text: str) -> Optional[str]:
 
 
 # =========================================================
-# DISCORD TRANSFORM
+# DISCORD HELPERS
 # =========================================================
 
 def transform_text_for_discord(raw_text: str) -> Optional[str]:
@@ -505,39 +479,40 @@ def split_text(text: str, limit: int = 1900) -> list[str]:
     return parts
 
 
-def send_to_pipedream_text(text: str):
+def send_discord_text(text: str):
     parts = split_text(text)
 
     for part in parts:
         response = requests.post(
-            PIPEDREAM_WEBHOOK_URL,
-            json={
-                "type": "text",
-                "text": part,
-            },
+            DISCORD_WEBHOOK_URL,
+            json={"content": part},
             timeout=30,
         )
         response.raise_for_status()
 
-    log("Sent text to Pipedream")
+    log("Sent text to Discord")
 
 
-def send_to_pipedream_photo(caption: str, image_bytes: bytes, filename: str = "photo.jpg"):
-    encoded = base64.b64encode(image_bytes).decode("utf-8")
+def send_discord_photo(caption: str, image_bytes: bytes, filename: str = "photo.jpg"):
+    data = {
+        "payload_json": html.unescape(
+            __import__("json").dumps({"content": caption or ""}, ensure_ascii=False)
+        )
+    }
+
+    files = {
+        "files[0]": (filename, image_bytes, "image/jpeg")
+    }
 
     response = requests.post(
-        PIPEDREAM_WEBHOOK_URL,
-        json={
-            "type": "photo",
-            "caption": caption,
-            "filename": filename,
-            "image_base64": encoded,
-        },
+        DISCORD_WEBHOOK_URL,
+        data=data,
+        files=files,
         timeout=60,
     )
     response.raise_for_status()
 
-    log("Sent photo to Pipedream")
+    log("Sent photo to Discord")
 
 
 # =========================================================
@@ -594,10 +569,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         log("Skip: not source channel")
         return
 
-    # =====================================================
-    # TELEGRAM TARGET
-    # =====================================================
-
     tg_result = transform_ifttt_text_for_telegram(raw_text)
 
     if msg.photo:
@@ -612,10 +583,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             log("Skip Telegram: empty result")
 
-    # =====================================================
-    # DISCORD / PIPEDREAM
-    # =====================================================
-
     try:
         dc_result = transform_text_for_discord(raw_text) or ""
 
@@ -626,19 +593,19 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             file_response = requests.get(tg_file.file_path, timeout=60)
             file_response.raise_for_status()
 
-            send_to_pipedream_photo(
+            send_discord_photo(
                 caption=dc_result,
                 image_bytes=file_response.content,
                 filename="photo.jpg",
             )
         else:
             if dc_result:
-                send_to_pipedream_text(dc_result)
+                send_discord_text(dc_result)
             else:
                 log("Skip Discord: empty result")
 
     except Exception as e:
-        log("Pipedream send error:", str(e))
+        log("Discord send error:", str(e))
 
 
 # =========================================================
