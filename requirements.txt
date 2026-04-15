@@ -1,3 +1,2 @@
 python-telegram-bot==22.2
 requests==2.32.3
-Pillow
