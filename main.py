@@ -5,9 +5,6 @@ import json
 import requests
 from io import BytesIO
 from typing import Optional
-from collections import deque
-
-from PIL import Image
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -28,8 +25,6 @@ TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 TARGET_MESSAGE_THREAD_ID = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0"))
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
-
-DISCORD_BG_PATH = "discord_bg.png"
 
 # =========================================================
 
@@ -504,75 +499,6 @@ def send_discord_text(text: str):
     log("Sent text to Discord")
 
 
-def _is_background_candidate(r: int, g: int, b: int) -> bool:
-    brightness = (r + g + b) / 3
-    spread = max(r, g, b) - min(r, g, b)
-
-    # Светло-серый/белый фон оригинальных скринов
-    return brightness >= 232 and spread <= 22
-
-
-def _build_background_mask(original_rgba: Image.Image) -> Image.Image:
-    """
-    Ищем фон не по всему изображению, а flood fill от границ.
-    Так мы заменяем только настоящий фон, а не белые/серые буквы и кнопки внутри UI.
-    """
-    rgb = original_rgba.convert("RGB")
-    width, height = rgb.size
-    pixels = rgb.load()
-
-    visited = [[False] * width for _ in range(height)]
-    mask = Image.new("L", (width, height), 0)
-    mask_px = mask.load()
-
-    q = deque()
-
-    # Стартуем только с рамки изображения
-    for x in range(width):
-        q.append((x, 0))
-        q.append((x, height - 1))
-    for y in range(height):
-        q.append((0, y))
-        q.append((width - 1, y))
-
-    while q:
-        x, y = q.popleft()
-
-        if x < 0 or y < 0 or x >= width or y >= height:
-            continue
-        if visited[y][x]:
-            continue
-
-        visited[y][x] = True
-
-        r, g, b = pixels[x, y]
-
-        if not _is_background_candidate(r, g, b):
-            continue
-
-        mask_px[x, y] = 255
-
-        q.append((x + 1, y))
-        q.append((x - 1, y))
-        q.append((x, y + 1))
-        q.append((x, y - 1))
-
-    return mask
-
-
-def stylize_discord_image(image_bytes: bytes) -> bytes:
-    original = Image.open(BytesIO(image_bytes)).convert("RGBA")
-    background = Image.open(DISCORD_BG_PATH).convert("RGBA").resize(original.size)
-
-    mask = _build_background_mask(original)
-    styled = Image.composite(background, original, mask)
-
-    output = BytesIO()
-    styled.save(output, format="PNG")
-    output.seek(0)
-    return output.getvalue()
-
-
 def send_discord_photo(caption: str, image_bytes: bytes, filename: str = "photo.png"):
     payload = {"content": caption or ""}
     data = {
@@ -682,21 +608,12 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             original_bytes = file_response.content
 
-            try:
-                styled_bytes = stylize_discord_image(original_bytes)
-                send_discord_photo(
-                    caption=dc_result,
-                    image_bytes=styled_bytes,
-                    filename="styled.png",
-                )
-                log("Sent styled photo to Discord")
-            except Exception as style_error:
-                log("Stylization failed, fallback to original:", str(style_error))
-                send_discord_photo(
-                    caption=dc_result,
-                    image_bytes=original_bytes,
-                    filename="original.png",
-                )
+            send_discord_photo(
+                caption=dc_result,
+                image_bytes=original_bytes,
+                filename="original.png",
+            )
+            log("Sent original photo to Discord")
 
         else:
             if dc_result:
