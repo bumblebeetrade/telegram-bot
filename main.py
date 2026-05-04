@@ -3,7 +3,6 @@ import re
 import html
 import json
 import requests
-from io import BytesIO
 from typing import Optional
 
 from telegram import Update
@@ -42,7 +41,85 @@ def validate_env():
 
 def log(*args):
     if DEBUG:
-        print(*args)
+        print(*args, flush=True)
+
+
+# =========================================================
+# HARD POST BLOCKER
+# =========================================================
+
+def should_block_entire_post(raw_text: str) -> bool:
+    """
+    Полностью запрещает пересылку рекламных/копитрейдинг-постов.
+    Важно: слово "profit" само по себе НЕ блокируем,
+    потому что оно может быть частью нормального сигнала.
+    """
+    if not raw_text:
+        return False
+
+    text = html.unescape(raw_text).lower()
+    text = re.sub(r"\s+", " ", text).strip()
+
+    blocked_exact_phrases = [
+        "crypto arki",
+        "arkii trades",
+        "arkiitrades",
+        "blofin copy trading username",
+        "copy trading username",
+        "copy trading",
+        "copy-trading",
+        "copytrade",
+        "copy trade",
+        "profit sharing ratio",
+        "strategy cycle",
+        "interested people can join",
+        "people can join",
+        "i will take trades here",
+        "not including 200-2k",
+        "i'm using 300$ here",
+        "im using 300$ here",
+        "join fast my telegram channel",
+        "join fast telegram channel",
+        "join my telegram channel",
+        "join our telegram channel",
+        "join telegram channel",
+        "join my telegram group",
+        "join telegram group",
+        "telegram channel in bio",
+        "telegram in bio",
+        "twitter in bio",
+        "x in bio",
+        "share live trades",
+        "live trades no paid/free group",
+        "no paid/free group",
+        "never dm first",
+        "dm first",
+        "you can copy my trades",
+        "copy my trades",
+        "signup & deposit",
+        "sign up & deposit",
+        "signup and deposit",
+        "sign up and deposit",
+        "steps & conditions to follow",
+        "steps and conditions to follow",
+    ]
+
+    if any(phrase in text for phrase in blocked_exact_phrases):
+        return True
+
+    # Блокируем AUM только как биржевой/копитрейдинг-контекст, а не любое случайное слово.
+    if re.search(r"\baum\b", text) and (
+        "usdt" in text or "copy" in text or "strategy" in text or "trading" in text
+    ):
+        return True
+
+    # Блокируем username только в рекламном/копитрейдинг-контексте.
+    if "username" in text and (
+        "copy" in text or "trading" in text or "blofin" in text or "arki" in text
+    ):
+        return True
+
+    return False
 
 
 # =========================================================
@@ -128,6 +205,13 @@ def should_drop_line(line: str, index: int) -> bool:
         "signup and deposit",
         "copy my trades",
         "copy trade",
+        "copy trading",
+        "copy-trading",
+        "copytrade",
+        "blofin copy trading username",
+        "copy trading username",
+        "profit sharing ratio",
+        "strategy cycle",
         "free group",
         "paid/free group",
         "share live trades",
@@ -145,6 +229,15 @@ def should_drop_line(line: str, index: int) -> bool:
         "send my budd",
         "partner.",
         "blofin",
+        "crypto arki",
+        "arkii trades",
+        "arkiitrades",
+        "interested people can join",
+        "people can join",
+        "i will take trades here",
+        "not including 200-2k",
+        "i'm using 300$ here",
+        "im using 300$ here",
         "join fast my telegram channel",
         "join fast telegram channel",
         "join my telegram channel",
@@ -188,6 +281,16 @@ def should_drop_line(line: str, index: int) -> bool:
     ]
 
     if any(p in low for p in ad_patterns):
+        return True
+
+    if re.search(r"\baum\b", low) and (
+        "usdt" in low or "copy" in low or "strategy" in low or "trading" in low
+    ):
+        return True
+
+    if "username" in low and (
+        "copy" in low or "trading" in low or "blofin" in low or "arki" in low
+    ):
         return True
 
     if "telegram" in low and ("join" in low or "channel" in low or "group" in low or "bio" in low):
@@ -574,6 +677,12 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         log("Skip: not source channel")
         return
 
+    # Полная блокировка рекламных / copy-trading / Crypto Arki постов
+    if should_block_entire_post(raw_text):
+        log("Blocked entire post by anti-spam filter")
+        log("Blocked raw text:", raw_text)
+        return
+
     # =====================================================
     # TELEGRAM TARGET
     # =====================================================
@@ -613,7 +722,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 image_bytes=original_bytes,
                 filename="original.png",
             )
-            log("Sent original photo to Discord")
 
         else:
             if dc_result:
@@ -622,7 +730,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 log("Skip Discord: empty result")
 
     except Exception as e:
-        log("Discord send error:", str(e))
+        log("Discord send error:", repr(e))
 
 
 # =========================================================
@@ -638,7 +746,7 @@ def main():
         MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post)
     )
 
-    print("Unified bot started...")
+    print("Unified bot started...", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 
