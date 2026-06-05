@@ -1,7 +1,7 @@
 """
 Telegram → Discord Bridge
 Arki канал: перевод на RU для TG + оригинал в Discord
-Selfbot с задержкой 2-3 мин → до 5 каналов с паузами 7-10 сек
+Selfbot с задержкой 2-3 мин → каналы с паузами 7-10 сек
 
 Команды:
   /start
@@ -314,8 +314,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Фильтр ────────────────────────────────────────────────────────────────────
 
 def should_block_entire_post(raw_text: str) -> bool:
+    # Пустой текст — не блокируем (может быть чистое фото)
     if not raw_text or len(raw_text.strip()) < 3:
-        return True
+        return False
 
     text = html.unescape(raw_text).lower()
     text = re.sub(r"\s+", " ", text).strip()
@@ -378,16 +379,13 @@ def should_drop_line(line: str, index: int) -> bool:
     low = stripped.lower()
     if not stripped:
         return False
-
     for pattern in DROP_LINE_RE:
         if pattern.search(stripped):
             return True
-
     if index == 0:
         pattern = r"^\s*\d+(?:\.\d+)?\$?\s*-\s*\d+(?:\.\d+)?\$?\s+trading\s+challenge\s*$"
         if re.match(pattern, stripped, re.IGNORECASE) and "completed" not in low:
             return True
-
     ad_patterns = [
         "telegram channel", "telegram group", "twitter channel",
         "twitter group", "x channel", "x group",
@@ -400,7 +398,6 @@ def should_drop_line(line: str, index: int) -> bool:
     ]
     if any(p in low for p in ad_patterns):
         return True
-
     if "telegram" in low and ("join" in low or "channel" in low or "group" in low or "bio" in low):
         return True
     if "twitter" in low and ("join" in low or "follow" in low or "bio" in low):
@@ -409,7 +406,6 @@ def should_drop_line(line: str, index: int) -> bool:
         return True
     if low.startswith("→ signup") or low.startswith("→ copy"):
         return True
-
     return False
 
 
@@ -450,49 +446,35 @@ def normalize_for_tg(text: str) -> str:
         if not line:
             out.append("")
             continue
-
-        low = line.lower()
-
-        # Баланс
         line = re.sub(r"(?i)\btotal\s+balance\s*[:\-]\s*([\-+]?[0-9]+(?:\.\d+)?\$?)", r"Итоговый баланс: \1", line)
         line = re.sub(r"(?i)\btotal\s+balance\s+left\s*[:\-]?\s*([\-+]?[0-9]+(?:\.\d+)?\$?)", r"Итоговый баланс: \1", line)
-
-        # Закрытие
         line = re.sub(r"(?i)\bclosed\s+for\s+\+?([0-9]+(?:\.\d+)?\$?)", r"Закрыл с прибылью +\1", line)
         line = re.sub(r"(?i)\bclosed\s+at\s+([0-9]+(?:\.\d+)?)\s+for\s+\+?([0-9]+(?:\.\d+)?\$?)", r"Закрыл по \1 с прибылью +\2", line)
         line = re.sub(r"(?i)\bclosing\s+(\$\w+)\s+(long|short)\s+at\s+([0-9]+(?:\.\d+)?)",
                       lambda m: f"Закрываю {m.group(1).upper()} {m.group(2).lower()} по {m.group(3)}", line)
-
-        # DCA
         line = re.sub(r"(?i)\b1st\s+dca\b", "1-й добор", line)
         line = re.sub(r"(?i)\b2nd\s+dca\b", "2-й добор", line)
         line = re.sub(r"(?i)\b3rd\s+dca\b", "3-й добор", line)
         line = re.sub(r"(?i)\b4th\s+dca\b", "4-й добор", line)
-
-        # SL / TP
         line = re.sub(r"(?i)\bsl\s*[:\-]?\s*([^\n]+)", r"Стоп: \1", line)
         line = re.sub(r"(?i)\bstops?\s*[:\-]?\s*([^\n]+)", r"Стоп: \1", line)
         line = re.sub(r"(?i)\btp\s*[:\-]?\s*([^\n]+)", r"Тейк: \1", line)
-
-        # Убыток / прибыль
         line = re.sub(r"(?i)\blost\s*([\-+]?\s*[0-9]+(?:\.\d+)?\$?)",
                       lambda m: f"Убыток: {m.group(1).replace(' ', '')}", line)
         line = re.sub(r"(?i)\bgained\s+\+?([0-9]+(?:\.\d+)?\$?)", r"Прибыль: +\1", line)
         line = re.sub(r"(?i)\bcrazy gains\b", "Безумная прибыль", line)
         line = re.sub(r"(?i)\bbig gains\b", "Хорошая прибыль", line)
         line = re.sub(r"(?i)\bnice gains\b", "Неплохая прибыль", line)
-
-        # Прогресс
         line = re.sub(r"(?i)(\d+)x\s+nearly\s+done", r"Почти сделано x\1", line)
         line = re.sub(r"(?i)\bnearly\s+done\b", "Почти сделано", line)
         line = re.sub(r"(?i)\banother\s+(\d+)x\s+done\b", r"Ещё x\1 сделано", line)
-
         out.append(line)
-
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
 
 def transform_for_telegram(raw_text: str) -> Optional[str]:
+    if not raw_text or len(raw_text.strip()) < 3:
+        return None
     cleaned = basic_cleanup(raw_text)
     if not cleaned:
         return None
@@ -500,9 +482,9 @@ def transform_for_telegram(raw_text: str) -> Optional[str]:
 
 
 def transform_for_discord(raw_text: str) -> Optional[str]:
-    cleaned = basic_cleanup(raw_text)
-    if not cleaned:
+    if not raw_text or len(raw_text.strip()) < 3:
         return None
+    cleaned = basic_cleanup(raw_text)
     return cleaned or None
 
 
