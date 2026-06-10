@@ -314,7 +314,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Фильтр ────────────────────────────────────────────────────────────────────
 
 def should_block_entire_post(raw_text: str) -> bool:
-    # Пустой текст — не блокируем (может быть чистое фото)
     if not raw_text or len(raw_text.strip()) < 3:
         return False
 
@@ -322,10 +321,25 @@ def should_block_entire_post(raw_text: str) -> bool:
     text = re.sub(r"\s+", " ", text).strip()
 
     blocked_phrases = [
+        # Arki watermark
         "crypto arki", "arkii trades", "arkiitrades",
+        # Copy trading
         "blofin copy trading username", "copy trading username",
         "copy trading", "copy-trading", "copytrade", "copy trade",
+        "copy trader", "copy my trades", "you can copy my trades",
+        "join copy trading", "1st trade running in copy",
+        # Биржи и партнёрки
+        "blofin", "bybit referral", "okx referral",
+        # Регистрация / депозит
         "profit sharing ratio", "strategy cycle",
+        "sign up using", "signup & deposit", "sign up & deposit",
+        "signup and deposit", "sign up and deposit",
+        "how to join", "steps & conditions to follow",
+        "steps and conditions to follow",
+        "minimum $100", "deposit",
+        "trade responsibly", "limited slots",
+        "full transparency", "same entries", "same exits",
+        # Реклама каналов
         "interested people can join", "people can join",
         "i will take trades here", "not including 200-2k",
         "i'm using 300$ here", "im using 300$ here",
@@ -336,10 +350,7 @@ def should_block_entire_post(raw_text: str) -> bool:
         "twitter in bio", "x in bio",
         "share live trades", "live trades no paid/free group",
         "no paid/free group", "never dm first", "dm first",
-        "you can copy my trades", "copy my trades",
-        "signup & deposit", "sign up & deposit",
-        "signup and deposit", "sign up and deposit",
-        "steps & conditions to follow", "steps and conditions to follow",
+        # Ссылки
         "https://", "http://",
     ]
 
@@ -355,10 +366,14 @@ def should_block_entire_post(raw_text: str) -> bool:
     if re.search(r"[🎉🎊🥳]{2,}", raw_text):
         return True
 
-    if re.search(r"\baum\b", text) and ("usdt" in text or "copy" in text or "strategy" in text or "trading" in text):
+    if re.search(r"\baum\b", text) and (
+        "usdt" in text or "copy" in text or "strategy" in text or "trading" in text
+    ):
         return True
 
-    if "username" in text and ("copy" in text or "trading" in text or "blofin" in text or "arki" in text):
+    if "username" in text and (
+        "copy" in text or "trading" in text or "blofin" in text or "arki" in text
+    ):
         return True
 
     return False
@@ -367,8 +382,22 @@ def should_block_entire_post(raw_text: str) -> bool:
 DROP_LINE_PATTERNS = [
     r"^переслано\s+из\b.*",
     r"^forwarded\s+from\b.*",
-    r"t\.me/\S+",
+    # Ссылки с протоколом
+    r"https?://\S+",
+    # Голые домены (blofin.com, bybit.com и т.д.)
+    r"\b\w[\w-]*\.\w{2,}(/\S*)?\b",
+    # @упоминания
     r"(^|\s)@[A-Za-z0-9_]{2,}",
+    # Copy trading строки
+    r"(?i)how\s+to\s+join",
+    r"(?i)steps\s*[&and]+\s*conditions",
+    r"(?i)sign\s*up\s+using",
+    r"(?i)join\s+copy\s+trading",
+    r"(?i)trade\s+responsibly",
+    r"(?i)limited\s+slots",
+    r"(?i)full\s+transparency",
+    r"(?i)same\s+entries",
+    r"(?i)same\s+exits",
 ]
 
 DROP_LINE_RE = [re.compile(p, re.IGNORECASE) for p in DROP_LINE_PATTERNS]
@@ -379,13 +408,16 @@ def should_drop_line(line: str, index: int) -> bool:
     low = stripped.lower()
     if not stripped:
         return False
+
     for pattern in DROP_LINE_RE:
         if pattern.search(stripped):
             return True
+
     if index == 0:
         pattern = r"^\s*\d+(?:\.\d+)?\$?\s*-\s*\d+(?:\.\d+)?\$?\s+trading\s+challenge\s*$"
         if re.match(pattern, stripped, re.IGNORECASE) and "completed" not in low:
             return True
+
     ad_patterns = [
         "telegram channel", "telegram group", "twitter channel",
         "twitter group", "x channel", "x group",
@@ -398,6 +430,7 @@ def should_drop_line(line: str, index: int) -> bool:
     ]
     if any(p in low for p in ad_patterns):
         return True
+
     if "telegram" in low and ("join" in low or "channel" in low or "group" in low or "bio" in low):
         return True
     if "twitter" in low and ("join" in low or "follow" in low or "bio" in low):
@@ -406,6 +439,7 @@ def should_drop_line(line: str, index: int) -> bool:
         return True
     if low.startswith("→ signup") or low.startswith("→ copy"):
         return True
+
     return False
 
 
