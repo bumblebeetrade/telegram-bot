@@ -350,6 +350,8 @@ def should_block_entire_post(raw_text: str) -> bool:
         "twitter in bio", "x in bio",
         "share live trades", "live trades no paid/free group",
         "no paid/free group", "never dm first", "dm first",
+        # Слово telegram — любое упоминание
+        "telegram",
         # Ссылки
         "https://", "http://",
     ]
@@ -384,8 +386,9 @@ DROP_LINE_PATTERNS = [
     r"^forwarded\s+from\b.*",
     # Ссылки с протоколом
     r"https?://\S+",
-    # Голые домены (blofin.com, bybit.com и т.д.)
-    r"\b\w[\w-]*\.\w{2,}(/\S*)?\b",
+    # Голые домены — только буквенные зоны (.com, .org, .io и т.д.)
+    # Числа типа 63.5k НЕ блокируются
+    r"\b[a-zA-Z][\w-]*\.[a-zA-Z]{2,}(/\S*)?\b",
     # @упоминания
     r"(^|\s)@[A-Za-z0-9_]{2,}",
     # Copy trading строки
@@ -427,12 +430,11 @@ def should_drop_line(line: str, index: int) -> bool:
         "thanks for supporting", "followers left",
         "announce giveaway", "send my budd", "partner.",
         "blofin", "crypto arki", "arkii trades", "arkiitrades",
+        "telegram",
     ]
     if any(p in low for p in ad_patterns):
         return True
 
-    if "telegram" in low and ("join" in low or "channel" in low or "group" in low or "bio" in low):
-        return True
     if "twitter" in low and ("join" in low or "follow" in low or "bio" in low):
         return True
     if re.search(r"\bx\b", low) and ("follow" in low or "join" in low) and ("bio" in low or "channel" in low):
@@ -567,8 +569,6 @@ def send_discord_webhook_photo(caption: str, image_bytes: bytes):
     log("✅ Webhook фото")
 
 
-# ── Telegram senders ──────────────────────────────────────────────────────────
-
 async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
     kwargs = dict(chat_id=TARGET_CHAT_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     if TARGET_MESSAGE_THREAD_ID:
@@ -614,7 +614,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         log("⏭ Skip Telegram: empty")
 
-    # 2. Discord webhook (мгновенно)
+    # 2. Discord webhook
     if DISCORD_WEBHOOK_URL:
         try:
             if msg.photo:
@@ -627,7 +627,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             log(f"❌ Webhook error: {repr(e)}")
 
-    # 3. Discord selfbot (задержка 2-3 мин, в фоне)
+    # 3. Discord selfbot
     if not dc_text and not msg.photo:
         log("⏭ Skip selfbot: empty")
         return
