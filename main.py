@@ -1,7 +1,7 @@
 """
 Telegram → Discord Bridge
 Arki канал: перевод на RU для TG + оригинал в Discord
-Selfbot с задержкой 2-3 мин → каналы с паузами 7-10 сек
+Selfbot с задержкой 2-3 мин → webhook Rebel Angels → каналы с паузами 7-10 сек
 
 Команды:
   /start
@@ -37,7 +37,8 @@ BOT_TOKEN                = os.getenv("BOT_TOKEN")
 SOURCE_CHANNEL           = int(os.getenv("SOURCE_CHANNEL", "0"))
 TARGET_CHAT_ID           = int(os.getenv("TARGET_CHAT_ID", "0"))
 TARGET_MESSAGE_THREAD_ID = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0") or "0")
-DISCORD_WEBHOOK_URL      = os.getenv("DISCORD_WEBHOOK_URL", "")
+DISCORD_WEBHOOK_URL      = os.getenv("DISCORD_WEBHOOK_URL", "")       # Bee (мгновенно)
+DISCORD_WEBHOOK_URL_2    = os.getenv("DISCORD_WEBHOOK_URL_2", "")     # Rebel Angels (с задержкой)
 DEBUG                    = os.getenv("DEBUG", "true").lower() == "true"
 DISCORD_TOKEN            = os.getenv("DISCORD_TOKEN", "")
 
@@ -132,12 +133,56 @@ async def discord_send_photo(file_bytes: bytes, filename: str, caption: str, cha
             return False
 
 
-async def selfbot_send(text: str = "", file_bytes: bytes = None, filename: str = "photo.jpg"):
-    if not DISCORD_TOKEN:
-        log("⏭ Selfbot: DISCORD_TOKEN не задан")
+def _send_webhook_text(url: str, text: str):
+    if not url:
         return
+    for part in split_text(text):
+        requests.post(url, json={"content": part}, timeout=30).raise_for_status()
+
+
+def _send_webhook_photo(url: str, caption: str, image_bytes: bytes):
+    if not url:
+        return
+    requests.post(
+        url,
+        data={"payload_json": json.dumps({"content": caption or ""}, ensure_ascii=False)},
+        files={"files[0]": ("photo.png", image_bytes, "image/png")},
+        timeout=60,
+    ).raise_for_status()
+
+
+async def delayed_send(text: str, img_bytes: Optional[bytes]):
+    """Задержка 2-3 мин → Rebel Angels webhook → пауза 7-10 сек → selfbot каналы."""
     if not bridge_enabled:
-        log("⏭ Selfbot: тумблер выключен")
+        return
+
+    delay = random.uniform(BRIDGE_DELAY_MIN, BRIDGE_DELAY_MAX)
+    log(f"⏳ Задержка {delay:.0f} сек ({delay/60:.1f} мин)...")
+    await asyncio.sleep(delay)
+
+    if not bridge_enabled:
+        return
+
+    # Rebel Angels webhook
+    if DISCORD_WEBHOOK_URL_2:
+        try:
+            if img_bytes:
+                _send_webhook_photo(DISCORD_WEBHOOK_URL_2, text, img_bytes)
+                log("✅ Webhook Rebel Angels фото")
+            elif text:
+                _send_webhook_text(DISCORD_WEBHOOK_URL_2, text)
+                log("✅ Webhook Rebel Angels текст")
+        except Exception as e:
+            log(f"❌ Webhook Rebel Angels error: {repr(e)}")
+
+    # Пауза 7-10 сек перед selfbot каналами
+    if active_channels:
+        pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
+        log(f"⏸ Пауза {pause:.1f} сек перед selfbot каналами...")
+        await asyncio.sleep(pause)
+
+    # Selfbot каналы
+    if not DISCORD_TOKEN:
         return
 
     targets = [(n, all_channels[n]) for n in active_channels if n in all_channels]
@@ -145,17 +190,13 @@ async def selfbot_send(text: str = "", file_bytes: bytes = None, filename: str =
         log("⏭ Selfbot: нет активных каналов")
         return
 
-    delay = random.uniform(BRIDGE_DELAY_MIN, BRIDGE_DELAY_MAX)
-    log(f"⏳ Задержка {delay:.0f} сек ({delay/60:.1f} мин) перед selfbot...")
-    await asyncio.sleep(delay)
-
     for i, (name, channel_id) in enumerate(targets):
         if i > 0:
             pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
             log(f"  ⏸ Пауза {pause:.1f} сек перед {name}")
             await asyncio.sleep(pause)
-        if file_bytes:
-            await discord_send_photo(file_bytes, filename, text, channel_id)
+        if img_bytes:
+            await discord_send_photo(img_bytes, "photo.jpg", text, channel_id)
         else:
             await discord_send_text(text, channel_id)
 
@@ -512,7 +553,7 @@ def transform_for_discord(raw_text: str) -> Optional[str]:
     return cleaned or None
 
 
-# ── Discord webhook ───────────────────────────────────────────────────────────
+# ── Discord webhook helpers ───────────────────────────────────────────────────
 
 def split_text(text: str, limit: int = 1900) -> list[str]:
     if len(text) <= limit:
@@ -542,7 +583,7 @@ def send_discord_webhook_text(text: str):
         return
     for part in split_text(text):
         requests.post(DISCORD_WEBHOOK_URL, json={"content": part}, timeout=30).raise_for_status()
-    log("✅ Webhook текст")
+    log("✅ Webhook Bee текст")
 
 
 def send_discord_webhook_photo(caption: str, image_bytes: bytes):
@@ -554,7 +595,7 @@ def send_discord_webhook_photo(caption: str, image_bytes: bytes):
         files={"files[0]": ("photo.png", image_bytes, "image/png")},
         timeout=60,
     ).raise_for_status()
-    log("✅ Webhook фото")
+    log("✅ Webhook Bee фото")
 
 
 async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -614,7 +655,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             log(f"❌ Ошибка скачивания фото: {repr(e)}")
 
-    # 3. Discord webhook (мгновенно)
+    # 3. Discord webhook Bee (мгновенно)
     if DISCORD_WEBHOOK_URL:
         try:
             if img_bytes:
@@ -622,20 +663,14 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             elif dc_text:
                 send_discord_webhook_text(dc_text)
         except Exception as e:
-            log(f"❌ Webhook error: {repr(e)}")
+            log(f"❌ Webhook Bee error: {repr(e)}")
 
-    # 4. Discord selfbot (задержка 2-3 мин, в фоне)
+    # 4. Задержка → Rebel Angels webhook → selfbot каналы (в фоне)
     if not dc_text and not img_bytes:
-        log("⏭ Skip selfbot: empty")
+        log("⏭ Skip delayed: empty")
         return
 
-    async def _selfbot_task():
-        try:
-            await selfbot_send(text=dc_text, file_bytes=img_bytes, filename="photo.jpg")
-        except Exception as e:
-            log(f"❌ Selfbot task error: {repr(e)}")
-
-    asyncio.create_task(_selfbot_task())
+    asyncio.create_task(delayed_send(dc_text, img_bytes))
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
