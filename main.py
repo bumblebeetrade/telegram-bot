@@ -321,16 +321,12 @@ def should_block_entire_post(raw_text: str) -> bool:
     text = re.sub(r"\s+", " ", text).strip()
 
     blocked_phrases = [
-        # Arki watermark
         "crypto arki", "arkii trades", "arkiitrades",
-        # Copy trading
         "blofin copy trading username", "copy trading username",
         "copy trading", "copy-trading", "copytrade", "copy trade",
         "copy trader", "copy my trades", "you can copy my trades",
         "join copy trading", "1st trade running in copy",
-        # Биржи и партнёрки
         "blofin", "bybit referral", "okx referral",
-        # Регистрация / депозит
         "profit sharing ratio", "strategy cycle",
         "sign up using", "signup & deposit", "sign up & deposit",
         "signup and deposit", "sign up and deposit",
@@ -339,7 +335,6 @@ def should_block_entire_post(raw_text: str) -> bool:
         "minimum $100", "deposit",
         "trade responsibly", "limited slots",
         "full transparency", "same entries", "same exits",
-        # Реклама каналов
         "interested people can join", "people can join",
         "i will take trades here", "not including 200-2k",
         "i'm using 300$ here", "im using 300$ here",
@@ -350,9 +345,7 @@ def should_block_entire_post(raw_text: str) -> bool:
         "twitter in bio", "x in bio",
         "share live trades", "live trades no paid/free group",
         "no paid/free group", "never dm first", "dm first",
-        # Слово telegram — любое упоминание
         "telegram",
-        # Ссылки
         "https://", "http://",
     ]
 
@@ -384,14 +377,9 @@ def should_block_entire_post(raw_text: str) -> bool:
 DROP_LINE_PATTERNS = [
     r"^переслано\s+из\b.*",
     r"^forwarded\s+from\b.*",
-    # Ссылки с протоколом
     r"https?://\S+",
-    # Голые домены — только буквенные зоны (.com, .org, .io и т.д.)
-    # Числа типа 63.5k НЕ блокируются
     r"\b[a-zA-Z][\w-]*\.[a-zA-Z]{2,}(/\S*)?\b",
-    # @упоминания
     r"(^|\s)@[A-Za-z0-9_]{2,}",
-    # Copy trading строки
     r"(?i)how\s+to\s+join",
     r"(?i)steps\s*[&and]+\s*conditions",
     r"(?i)sign\s*up\s+using",
@@ -614,33 +602,36 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         log("⏭ Skip Telegram: empty")
 
-    # 2. Discord webhook
+    # 2. Скачиваем фото один раз для всех Discord получателей
+    img_bytes = None
+    if msg.photo:
+        try:
+            tg_file = await context.bot.get_file(msg.photo[-1].file_id)
+            img = requests.get(tg_file.file_path, timeout=60)
+            img.raise_for_status()
+            img_bytes = img.content
+            log("✅ Фото скачано")
+        except Exception as e:
+            log(f"❌ Ошибка скачивания фото: {repr(e)}")
+
+    # 3. Discord webhook (мгновенно)
     if DISCORD_WEBHOOK_URL:
         try:
-            if msg.photo:
-                tg_file = await context.bot.get_file(msg.photo[-1].file_id)
-                img = requests.get(tg_file.file_path, timeout=60)
-                img.raise_for_status()
-                send_discord_webhook_photo(dc_text, img.content)
+            if img_bytes:
+                send_discord_webhook_photo(dc_text, img_bytes)
             elif dc_text:
                 send_discord_webhook_text(dc_text)
         except Exception as e:
             log(f"❌ Webhook error: {repr(e)}")
 
-    # 3. Discord selfbot
-    if not dc_text and not msg.photo:
+    # 4. Discord selfbot (задержка 2-3 мин, в фоне)
+    if not dc_text and not img_bytes:
         log("⏭ Skip selfbot: empty")
         return
 
     async def _selfbot_task():
         try:
-            if msg.photo:
-                tg_file = await context.bot.get_file(msg.photo[-1].file_id)
-                img = requests.get(tg_file.file_path, timeout=60)
-                img.raise_for_status()
-                await selfbot_send(text=dc_text, file_bytes=img.content, filename="photo.jpg")
-            else:
-                await selfbot_send(text=dc_text)
+            await selfbot_send(text=dc_text, file_bytes=img_bytes, filename="photo.jpg")
         except Exception as e:
             log(f"❌ Selfbot task error: {repr(e)}")
 
