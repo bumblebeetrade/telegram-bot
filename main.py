@@ -37,8 +37,8 @@ BOT_TOKEN                = os.getenv("BOT_TOKEN")
 SOURCE_CHANNEL           = int(os.getenv("SOURCE_CHANNEL", "0"))
 TARGET_CHAT_ID           = int(os.getenv("TARGET_CHAT_ID", "0"))
 TARGET_MESSAGE_THREAD_ID = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0") or "0")
-DISCORD_WEBHOOK_URL      = os.getenv("DISCORD_WEBHOOK_URL", "")       # Bee (мгновенно)
-DISCORD_WEBHOOK_URL_2    = os.getenv("DISCORD_WEBHOOK_URL_2", "")     # Rebel Angels (с задержкой)
+DISCORD_WEBHOOK_URL      = os.getenv("DISCORD_WEBHOOK_URL", "")
+DISCORD_WEBHOOK_URL_2    = os.getenv("DISCORD_WEBHOOK_URL_2", "")
 DEBUG                    = os.getenv("DEBUG", "true").lower() == "true"
 DISCORD_TOKEN            = os.getenv("DISCORD_TOKEN", "")
 
@@ -175,13 +175,11 @@ async def delayed_send(text: str, img_bytes: Optional[bytes]):
         except Exception as e:
             log(f"❌ Webhook Rebel Angels error: {repr(e)}")
 
-    # Пауза 7-10 сек перед selfbot каналами
     if active_channels:
         pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
         log(f"⏸ Пауза {pause:.1f} сек перед selfbot каналами...")
         await asyncio.sleep(pause)
 
-    # Selfbot каналы
     if not DISCORD_TOKEN:
         return
 
@@ -362,12 +360,16 @@ def should_block_entire_post(raw_text: str) -> bool:
     text = re.sub(r"\s+", " ", text).strip()
 
     blocked_phrases = [
+        # Arki watermark
         "crypto arki", "arkii trades", "arkiitrades",
+        # Copy trading
         "blofin copy trading username", "copy trading username",
         "copy trading", "copy-trading", "copytrade", "copy trade",
         "copy trader", "copy my trades", "you can copy my trades",
         "join copy trading", "1st trade running in copy",
+        # Биржи и партнёрки
         "blofin", "bybit referral", "okx referral",
+        # Регистрация / депозит
         "profit sharing ratio", "strategy cycle",
         "sign up using", "signup & deposit", "sign up & deposit",
         "signup and deposit", "sign up and deposit",
@@ -376,6 +378,14 @@ def should_block_entire_post(raw_text: str) -> bool:
         "minimum $100", "deposit",
         "trade responsibly", "limited slots",
         "full transparency", "same entries", "same exits",
+        # Реклама / группы
+        "paid group",
+        "i will add them",
+        "add them in my",
+        "whoever joined",
+        "hope still you believe",
+        "1-2 trades per day",
+        # Реклама каналов
         "interested people can join", "people can join",
         "i will take trades here", "not including 200-2k",
         "i'm using 300$ here", "im using 300$ here",
@@ -386,7 +396,9 @@ def should_block_entire_post(raw_text: str) -> bool:
         "twitter in bio", "x in bio",
         "share live trades", "live trades no paid/free group",
         "no paid/free group", "never dm first", "dm first",
+        # Telegram
         "telegram",
+        # Ссылки
         "https://", "http://",
     ]
 
@@ -643,17 +655,23 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         log("⏭ Skip Telegram: empty")
 
-    # 2. Скачиваем фото один раз для всех Discord получателей
+    # 2. Скачиваем фото один раз — с повторными попытками
     img_bytes = None
     if msg.photo:
-        try:
-            tg_file = await context.bot.get_file(msg.photo[-1].file_id)
-            img = requests.get(tg_file.file_path, timeout=60)
-            img.raise_for_status()
-            img_bytes = img.content
-            log("✅ Фото скачано")
-        except Exception as e:
-            log(f"❌ Ошибка скачивания фото: {repr(e)}")
+        tg_file = await context.bot.get_file(msg.photo[-1].file_id)
+        for attempt in range(3):
+            try:
+                img = requests.get(tg_file.file_path, timeout=120)
+                img.raise_for_status()
+                img_bytes = img.content
+                log("✅ Фото скачано")
+                break
+            except Exception as e:
+                log(f"⚠️ Попытка {attempt+1}/3 скачать фото: {repr(e)}")
+                if attempt < 2:
+                    await asyncio.sleep(5)
+        if img_bytes is None:
+            log("❌ Не удалось скачать фото после 3 попыток")
 
     # 3. Discord webhook Bee (мгновенно)
     if DISCORD_WEBHOOK_URL:
