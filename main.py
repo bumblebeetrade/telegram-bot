@@ -163,7 +163,6 @@ async def delayed_send(text: str, img_bytes: Optional[bytes]):
     if not bridge_enabled:
         return
 
-    # Rebel Angels webhook
     if DISCORD_WEBHOOK_URL_2:
         try:
             if img_bytes:
@@ -360,16 +359,12 @@ def should_block_entire_post(raw_text: str) -> bool:
     text = re.sub(r"\s+", " ", text).strip()
 
     blocked_phrases = [
-        # Arki watermark
         "crypto arki", "arkii trades", "arkiitrades",
-        # Copy trading
         "blofin copy trading username", "copy trading username",
         "copy trading", "copy-trading", "copytrade", "copy trade",
         "copy trader", "copy my trades", "you can copy my trades",
         "join copy trading", "1st trade running in copy",
-        # Биржи и партнёрки
         "blofin", "bybit referral", "okx referral",
-        # Регистрация / депозит
         "profit sharing ratio", "strategy cycle",
         "sign up using", "signup & deposit", "sign up & deposit",
         "signup and deposit", "sign up and deposit",
@@ -378,14 +373,12 @@ def should_block_entire_post(raw_text: str) -> bool:
         "minimum $100", "deposit",
         "trade responsibly", "limited slots",
         "full transparency", "same entries", "same exits",
-        # Реклама / группы
         "paid group",
         "i will add them",
         "add them in my",
         "whoever joined",
         "hope still you believe",
         "1-2 trades per day",
-        # Реклама каналов
         "interested people can join", "people can join",
         "i will take trades here", "not including 200-2k",
         "i'm using 300$ here", "im using 300$ here",
@@ -396,9 +389,7 @@ def should_block_entire_post(raw_text: str) -> bool:
         "twitter in bio", "x in bio",
         "share live trades", "live trades no paid/free group",
         "no paid/free group", "never dm first", "dm first",
-        # Telegram
         "telegram",
-        # Ссылки
         "https://", "http://",
     ]
 
@@ -655,12 +646,12 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         log("⏭ Skip Telegram: empty")
 
-    # 2. Скачиваем фото один раз — с повторными попытками
+    # 2. Скачиваем фото один раз — get_file и download тоже в retry
     img_bytes = None
     if msg.photo:
-        tg_file = await context.bot.get_file(msg.photo[-1].file_id)
         for attempt in range(3):
             try:
+                tg_file = await context.bot.get_file(msg.photo[-1].file_id)
                 img = requests.get(tg_file.file_path, timeout=120)
                 img.raise_for_status()
                 img_bytes = img.content
