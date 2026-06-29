@@ -33,14 +33,19 @@ from telegram.ext import (
     filters,
 )
 
-BOT_TOKEN                = os.getenv("BOT_TOKEN")
-SOURCE_CHANNEL           = int(os.getenv("SOURCE_CHANNEL", "0"))
-TARGET_CHAT_ID           = int(os.getenv("TARGET_CHAT_ID", "0"))
-TARGET_MESSAGE_THREAD_ID = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0") or "0")
-DISCORD_WEBHOOK_URL      = os.getenv("DISCORD_WEBHOOK_URL", "")
-DISCORD_WEBHOOK_URL_2    = os.getenv("DISCORD_WEBHOOK_URL_2", "")
-DEBUG                    = os.getenv("DEBUG", "true").lower() == "true"
-DISCORD_TOKEN            = os.getenv("DISCORD_TOKEN", "")
+BOT_TOKEN                  = os.getenv("BOT_TOKEN")
+SOURCE_CHANNEL             = int(os.getenv("SOURCE_CHANNEL", "0"))
+
+TARGET_CHAT_ID             = int(os.getenv("TARGET_CHAT_ID", "0"))
+TARGET_MESSAGE_THREAD_ID   = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0") or "0")
+
+TARGET_CHAT_ID_2           = int(os.getenv("TARGET_CHAT_ID_2", "0"))
+TARGET_MESSAGE_THREAD_ID_2 = int(os.getenv("TARGET_MESSAGE_THREAD_ID_2", "0") or "0")
+
+DISCORD_WEBHOOK_URL        = os.getenv("DISCORD_WEBHOOK_URL", "")
+DISCORD_WEBHOOK_URL_2      = os.getenv("DISCORD_WEBHOOK_URL_2", "")
+DEBUG                      = os.getenv("DEBUG", "true").lower() == "true"
+DISCORD_TOKEN              = os.getenv("DISCORD_TOKEN", "")
 
 _admin_raw = os.getenv("ADMIN_ID", "0")
 ADMIN_IDS  = {int(x.strip()) for x in _admin_raw.split(",") if x.strip().isdigit()}
@@ -602,21 +607,43 @@ def send_discord_webhook_photo(caption: str, image_bytes: bytes):
 
 
 async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
-    kwargs = dict(chat_id=TARGET_CHAT_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    if TARGET_MESSAGE_THREAD_ID:
-        kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
-    await context.bot.send_message(**kwargs)
-    log("✅ Sent text to Telegram")
+    # TG канал #1
+    if TARGET_CHAT_ID:
+        kwargs = dict(chat_id=TARGET_CHAT_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        if TARGET_MESSAGE_THREAD_ID:
+            kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
+        await context.bot.send_message(**kwargs)
+        log("✅ Sent text to TG #1")
+
+    # TG канал #2
+    if TARGET_CHAT_ID_2:
+        kwargs = dict(chat_id=TARGET_CHAT_ID_2, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        if TARGET_MESSAGE_THREAD_ID_2:
+            kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
+        await context.bot.send_message(**kwargs)
+        log("✅ Sent text to TG #2")
 
 
 async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str, caption: Optional[str]):
-    kwargs = dict(chat_id=TARGET_CHAT_ID, photo=file_id)
-    if caption:
-        kwargs["caption"] = caption
-    if TARGET_MESSAGE_THREAD_ID:
-        kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
-    await context.bot.send_photo(**kwargs)
-    log("✅ Sent photo to Telegram")
+    # TG канал #1
+    if TARGET_CHAT_ID:
+        kwargs = dict(chat_id=TARGET_CHAT_ID, photo=file_id)
+        if caption:
+            kwargs["caption"] = caption
+        if TARGET_MESSAGE_THREAD_ID:
+            kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
+        await context.bot.send_photo(**kwargs)
+        log("✅ Sent photo to TG #1")
+
+    # TG канал #2
+    if TARGET_CHAT_ID_2:
+        kwargs = dict(chat_id=TARGET_CHAT_ID_2, photo=file_id)
+        if caption:
+            kwargs["caption"] = caption
+        if TARGET_MESSAGE_THREAD_ID_2:
+            kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
+        await context.bot.send_photo(**kwargs)
+        log("✅ Sent photo to TG #2")
 
 
 # ── Handler ───────────────────────────────────────────────────────────────────
@@ -638,7 +665,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     tg_text = transform_for_telegram(raw_text)
     dc_text = transform_for_discord(raw_text) or ""
 
-    # 1. Telegram
+    # 1. Telegram (оба канала)
     if msg.photo:
         await send_tg_photo(context, msg.photo[-1].file_id, tg_text)
     elif tg_text:
@@ -646,7 +673,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         log("⏭ Skip Telegram: empty")
 
-    # 2. Скачиваем фото один раз — get_file и download тоже в retry
+    # 2. Скачиваем фото один раз — get_file и download в retry
     img_bytes = None
     if msg.photo:
         for attempt in range(3):
