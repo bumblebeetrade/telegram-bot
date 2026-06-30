@@ -606,44 +606,54 @@ def send_discord_webhook_photo(caption: str, image_bytes: bytes):
     log("✅ Webhook Bee фото")
 
 
-async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
-    # TG канал #1
-    if TARGET_CHAT_ID:
-        kwargs = dict(chat_id=TARGET_CHAT_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        if TARGET_MESSAGE_THREAD_ID:
-            kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
-        await context.bot.send_message(**kwargs)
-        log("✅ Sent text to TG #1")
+# ── Telegram senders с try/except для каждого канала отдельно ────────────────
 
-    # TG канал #2
+async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
+    if TARGET_CHAT_ID:
+        try:
+            kwargs = dict(chat_id=TARGET_CHAT_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            if TARGET_MESSAGE_THREAD_ID:
+                kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
+            await context.bot.send_message(**kwargs)
+            log("✅ Sent text to TG #1")
+        except Exception as e:
+            log(f"❌ TG #1 error: {repr(e)}")
+
     if TARGET_CHAT_ID_2:
-        kwargs = dict(chat_id=TARGET_CHAT_ID_2, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        if TARGET_MESSAGE_THREAD_ID_2:
-            kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
-        await context.bot.send_message(**kwargs)
-        log("✅ Sent text to TG #2")
+        try:
+            kwargs = dict(chat_id=TARGET_CHAT_ID_2, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            if TARGET_MESSAGE_THREAD_ID_2:
+                kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
+            await context.bot.send_message(**kwargs)
+            log("✅ Sent text to TG #2")
+        except Exception as e:
+            log(f"❌ TG #2 error: {repr(e)}")
 
 
 async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str, caption: Optional[str]):
-    # TG канал #1
     if TARGET_CHAT_ID:
-        kwargs = dict(chat_id=TARGET_CHAT_ID, photo=file_id)
-        if caption:
-            kwargs["caption"] = caption
-        if TARGET_MESSAGE_THREAD_ID:
-            kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
-        await context.bot.send_photo(**kwargs)
-        log("✅ Sent photo to TG #1")
+        try:
+            kwargs = dict(chat_id=TARGET_CHAT_ID, photo=file_id)
+            if caption:
+                kwargs["caption"] = caption
+            if TARGET_MESSAGE_THREAD_ID:
+                kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
+            await context.bot.send_photo(**kwargs)
+            log("✅ Sent photo to TG #1")
+        except Exception as e:
+            log(f"❌ TG #1 photo error: {repr(e)}")
 
-    # TG канал #2
     if TARGET_CHAT_ID_2:
-        kwargs = dict(chat_id=TARGET_CHAT_ID_2, photo=file_id)
-        if caption:
-            kwargs["caption"] = caption
-        if TARGET_MESSAGE_THREAD_ID_2:
-            kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
-        await context.bot.send_photo(**kwargs)
-        log("✅ Sent photo to TG #2")
+        try:
+            kwargs = dict(chat_id=TARGET_CHAT_ID_2, photo=file_id)
+            if caption:
+                kwargs["caption"] = caption
+            if TARGET_MESSAGE_THREAD_ID_2:
+                kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
+            await context.bot.send_photo(**kwargs)
+            log("✅ Sent photo to TG #2")
+        except Exception as e:
+            log(f"❌ TG #2 photo error: {repr(e)}")
 
 
 # ── Handler ───────────────────────────────────────────────────────────────────
@@ -665,7 +675,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     tg_text = transform_for_telegram(raw_text)
     dc_text = transform_for_discord(raw_text) or ""
 
-    # 1. Telegram (оба канала)
+    # 1. Telegram (оба канала, ошибки не блокируют дальнейшее)
     if msg.photo:
         await send_tg_photo(context, msg.photo[-1].file_id, tg_text)
     elif tg_text:
