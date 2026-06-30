@@ -10,6 +10,7 @@ Selfbot с задержкой 2-3 мин → webhook Rebel Angels → канал
   /removechannel <название>    — удалить канал
   /bridge                      — тумблер автопересылки
   /status                      — статус Discord
+  /checkchats                  — диагностика доступа к TG таргетам
 """
 
 import os
@@ -218,7 +219,36 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/addchannel &lt;название&gt; &lt;id&gt; — добавить канал\n"
         "/removechannel &lt;название&gt; — удалить канал\n"
         "/bridge — тумблер автопересылки\n"
-        "/status — статус Discord",
+        "/status — статус Discord\n"
+        "/checkchats — диагностика TG таргетов",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_checkchats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    results = []
+
+    targets = [
+        ("TG #1", TARGET_CHAT_ID, TARGET_MESSAGE_THREAD_ID),
+        ("TG #2", TARGET_CHAT_ID_2, TARGET_MESSAGE_THREAD_ID_2),
+    ]
+
+    for label, chat_id, thread_id in targets:
+        if not chat_id:
+            results.append(f"⚪ {label}: не задан")
+            continue
+        try:
+            chat = await ctx.bot.get_chat(chat_id)
+            title = chat.title or chat.first_name or "?"
+            results.append(f"✅ {label}: <code>{chat_id}</code> (thread {thread_id}) — {html.escape(title)}")
+        except Exception as e:
+            results.append(f"❌ {label}: <code>{chat_id}</code> (thread {thread_id}) — {html.escape(repr(e))}")
+
+    await update.message.reply_text(
+        "🔍 <b>Проверка доступа к чатам:</b>\n\n" + "\n".join(results),
         parse_mode="HTML",
     )
 
@@ -606,7 +636,7 @@ def send_discord_webhook_photo(caption: str, image_bytes: bytes):
     log("✅ Webhook Bee фото")
 
 
-# ── Telegram senders с try/except для каждого канала отдельно ────────────────
+# ── Telegram senders — каждый канал в своём try/except ───────────────────────
 
 async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
     if TARGET_CHAT_ID:
@@ -731,6 +761,7 @@ def main():
     app.add_handler(CommandHandler("removechannel", cmd_removechannel))
     app.add_handler(CommandHandler("bridge",        cmd_bridge))
     app.add_handler(CommandHandler("status",        cmd_status))
+    app.add_handler(CommandHandler("checkchats",    cmd_checkchats))
     app.add_handler(CallbackQueryHandler(cb_ch_toggle,     pattern=r"^chtoggle:"))
     app.add_handler(CallbackQueryHandler(cb_bridge_toggle, pattern=r"^bridge_toggle$"))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
