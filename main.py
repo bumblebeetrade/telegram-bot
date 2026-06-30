@@ -23,7 +23,7 @@ import requests
 import aiohttp
 from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -35,6 +35,8 @@ from telegram.ext import (
 )
 
 BOT_TOKEN                  = os.getenv("BOT_TOKEN")
+BOT_TOKEN_2                = os.getenv("BOT_TOKEN_2", "")  # Heaven — для TG #2
+
 SOURCE_CHANNEL             = int(os.getenv("SOURCE_CHANNEL", "0"))
 
 TARGET_CHAT_ID             = int(os.getenv("TARGET_CHAT_ID", "0"))
@@ -231,21 +233,30 @@ async def cmd_checkchats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     results = []
 
-    targets = [
-        ("TG #1", TARGET_CHAT_ID, TARGET_MESSAGE_THREAD_ID),
-        ("TG #2", TARGET_CHAT_ID_2, TARGET_MESSAGE_THREAD_ID_2),
-    ]
-
-    for label, chat_id, thread_id in targets:
-        if not chat_id:
-            results.append(f"⚪ {label}: не задан")
-            continue
+    # TG #1 — основной бот
+    if TARGET_CHAT_ID:
         try:
-            chat = await ctx.bot.get_chat(chat_id)
+            chat = await ctx.bot.get_chat(TARGET_CHAT_ID)
             title = chat.title or chat.first_name or "?"
-            results.append(f"✅ {label}: <code>{chat_id}</code> (thread {thread_id}) — {html.escape(title)}")
+            results.append(f"✅ TG #1: <code>{TARGET_CHAT_ID}</code> (thread {TARGET_MESSAGE_THREAD_ID}) — {html.escape(title)}")
         except Exception as e:
-            results.append(f"❌ {label}: <code>{chat_id}</code> (thread {thread_id}) — {html.escape(repr(e))}")
+            results.append(f"❌ TG #1: <code>{TARGET_CHAT_ID}</code> (thread {TARGET_MESSAGE_THREAD_ID}) — {html.escape(repr(e))}")
+    else:
+        results.append("⚪ TG #1: не задан")
+
+    # TG #2 — Heaven бот
+    if TARGET_CHAT_ID_2 and BOT_TOKEN_2:
+        try:
+            bot2 = Bot(token=BOT_TOKEN_2)
+            chat = await bot2.get_chat(TARGET_CHAT_ID_2)
+            title = chat.title or chat.first_name or "?"
+            results.append(f"✅ TG #2 (Heaven): <code>{TARGET_CHAT_ID_2}</code> (thread {TARGET_MESSAGE_THREAD_ID_2}) — {html.escape(title)}")
+        except Exception as e:
+            results.append(f"❌ TG #2 (Heaven): <code>{TARGET_CHAT_ID_2}</code> (thread {TARGET_MESSAGE_THREAD_ID_2}) — {html.escape(repr(e))}")
+    elif TARGET_CHAT_ID_2:
+        results.append("⚪ TG #2: BOT_TOKEN_2 не задан")
+    else:
+        results.append("⚪ TG #2: не задан")
 
     await update.message.reply_text(
         "🔍 <b>Проверка доступа к чатам:</b>\n\n" + "\n".join(results),
@@ -636,7 +647,7 @@ def send_discord_webhook_photo(caption: str, image_bytes: bytes):
     log("✅ Webhook Bee фото")
 
 
-# ── Telegram senders — каждый канал в своём try/except ───────────────────────
+# ── Telegram senders — каждый канал в своём try/except + свой токен ──────────
 
 async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
     if TARGET_CHAT_ID:
@@ -649,15 +660,16 @@ async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
         except Exception as e:
             log(f"❌ TG #1 error: {repr(e)}")
 
-    if TARGET_CHAT_ID_2:
+    if TARGET_CHAT_ID_2 and BOT_TOKEN_2:
         try:
+            bot2 = Bot(token=BOT_TOKEN_2)
             kwargs = dict(chat_id=TARGET_CHAT_ID_2, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             if TARGET_MESSAGE_THREAD_ID_2:
                 kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
-            await context.bot.send_message(**kwargs)
-            log("✅ Sent text to TG #2")
+            await bot2.send_message(**kwargs)
+            log("✅ Sent text to TG #2 (Heaven)")
         except Exception as e:
-            log(f"❌ TG #2 error: {repr(e)}")
+            log(f"❌ TG #2 (Heaven) error: {repr(e)}")
 
 
 async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str, caption: Optional[str]):
@@ -673,17 +685,18 @@ async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str, captio
         except Exception as e:
             log(f"❌ TG #1 photo error: {repr(e)}")
 
-    if TARGET_CHAT_ID_2:
+    if TARGET_CHAT_ID_2 and BOT_TOKEN_2:
         try:
+            bot2 = Bot(token=BOT_TOKEN_2)
             kwargs = dict(chat_id=TARGET_CHAT_ID_2, photo=file_id)
             if caption:
                 kwargs["caption"] = caption
             if TARGET_MESSAGE_THREAD_ID_2:
                 kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
-            await context.bot.send_photo(**kwargs)
-            log("✅ Sent photo to TG #2")
+            await bot2.send_photo(**kwargs)
+            log("✅ Sent photo to TG #2 (Heaven)")
         except Exception as e:
-            log(f"❌ TG #2 photo error: {repr(e)}")
+            log(f"❌ TG #2 (Heaven) photo error: {repr(e)}")
 
 
 # ── Handler ───────────────────────────────────────────────────────────────────
