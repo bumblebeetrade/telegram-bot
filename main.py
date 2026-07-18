@@ -672,7 +672,9 @@ async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
             log(f"❌ TG #2 (Heaven) error: {repr(e)}")
 
 
-async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str, caption: Optional[str]):
+async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str,
+                        caption: Optional[str], img_bytes: Optional[bytes] = None):
+    # TG #1 — тот же бот, что принял апдейт → file_id валиден
     if TARGET_CHAT_ID:
         try:
             kwargs = dict(chat_id=TARGET_CHAT_ID, photo=file_id)
@@ -685,10 +687,15 @@ async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str, captio
         except Exception as e:
             log(f"❌ TG #1 photo error: {repr(e)}")
 
+    # TG #2 (Heaven) — ДРУГОЙ бот: file_id от бота #1 у него невалиден
+    # ('Wrong file identifier'), поэтому шлём фото байтами
     if TARGET_CHAT_ID_2 and BOT_TOKEN_2:
+        if not img_bytes:
+            log("❌ TG #2 (Heaven): нет байтов фото — пропуск (file_id чужого бота слать нельзя)")
+            return
         try:
             bot2 = Bot(token=BOT_TOKEN_2)
-            kwargs = dict(chat_id=TARGET_CHAT_ID_2, photo=file_id)
+            kwargs = dict(chat_id=TARGET_CHAT_ID_2, photo=img_bytes)
             if caption:
                 kwargs["caption"] = caption
             if TARGET_MESSAGE_THREAD_ID_2:
@@ -718,15 +725,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     tg_text = transform_for_telegram(raw_text)
     dc_text = transform_for_discord(raw_text) or ""
 
-    # 1. Telegram (оба канала, ошибки не блокируют дальнейшее)
-    if msg.photo:
-        await send_tg_photo(context, msg.photo[-1].file_id, tg_text)
-    elif tg_text:
-        await send_tg_text(context, tg_text)
-    else:
-        log("⏭ Skip Telegram: empty")
-
-    # 2. Скачиваем фото один раз — get_file и download в retry
+    # 1. Скачиваем фото один раз — нужно и для TG #2 (Heaven), и для Discord
     img_bytes = None
     if msg.photo:
         for attempt in range(3):
@@ -743,6 +742,14 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                     await asyncio.sleep(5)
         if img_bytes is None:
             log("❌ Не удалось скачать фото после 3 попыток")
+
+    # 2. Telegram (оба канала, ошибки не блокируют дальнейшее)
+    if msg.photo:
+        await send_tg_photo(context, msg.photo[-1].file_id, tg_text, img_bytes)
+    elif tg_text:
+        await send_tg_text(context, tg_text)
+    else:
+        log("⏭ Skip Telegram: empty")
 
     # 3. Discord webhook Bee (мгновенно)
     if DISCORD_WEBHOOK_URL:
