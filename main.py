@@ -2,6 +2,7 @@
 Telegram → Discord Bridge
 Arki канал: перевод на RU для TG + оригинал в Discord
 Selfbot с задержкой 2-3 мин → webhook Rebel Angels → каналы с паузами 7-10 сек
+Плюс таргет от лица моего аккаунта (Telethon)
 
 Команды:
   /start
@@ -14,6 +15,7 @@ Selfbot с задержкой 2-3 мин → webhook Rebel Angels → канал
 """
 
 import os
+import io
 import re
 import html
 import json
@@ -34,6 +36,9 @@ from telegram.ext import (
     filters,
 )
 
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+
 BOT_TOKEN                  = os.getenv("BOT_TOKEN")
 BOT_TOKEN_2                = os.getenv("BOT_TOKEN_2", "")  # Heaven — для TG #2
 
@@ -44,6 +49,13 @@ TARGET_MESSAGE_THREAD_ID   = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0") or "
 
 TARGET_CHAT_ID_2           = int(os.getenv("TARGET_CHAT_ID_2", "0"))
 TARGET_MESSAGE_THREAD_ID_2 = int(os.getenv("TARGET_MESSAGE_THREAD_ID_2", "0") or "0")
+
+# ── Таргет от лица моего аккаунта (Telethon) ─────────────────────────────────
+TG_API_ID                  = int(os.getenv("TG_API_ID", "0") or "0")
+TG_API_HASH                = os.getenv("TG_API_HASH", "")
+TG_USER_SESSION            = os.getenv("TG_USER_SESSION", "")
+USER_TARGET_CHAT           = os.getenv("USER_TARGET_CHAT", "")
+USER_TARGET_TOPIC_ID       = int(os.getenv("USER_TARGET_TOPIC_ID", "0") or "0")
 
 DISCORD_WEBHOOK_URL        = os.getenv("DISCORD_WEBHOOK_URL", "")
 DISCORD_WEBHOOK_URL_2      = os.getenv("DISCORD_WEBHOOK_URL_2", "")
@@ -75,6 +87,9 @@ def _parse_channels_env() -> dict:
 all_channels: dict[str, str] = _parse_channels_env()
 active_channels: set[str]    = set(all_channels.keys())
 bridge_enabled: bool          = True
+
+user_client = None   # Telethon-клиент (мой аккаунт)
+user_entity = None   # разрезолвленная целевая группа
 
 
 def validate_env():
@@ -258,6 +273,22 @@ async def cmd_checkchats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         results.append("⚪ TG #2: не задан")
 
+    # TG #3 — мой аккаунт (Telethon)
+    if user_client and user_entity:
+        try:
+            me = await user_client.get_me()
+            title = getattr(user_entity, "title", None) or getattr(user_entity, "username", "?")
+            results.append(
+                f"✅ TG #3 (мой аккаунт @{html.escape(me.username or me.first_name or '?')}): "
+                f"<code>{html.escape(USER_TARGET_CHAT)}</code> (topic {USER_TARGET_TOPIC_ID}) — {html.escape(str(title))}"
+            )
+        except Exception as e:
+            results.append(f"❌ TG #3 (мой аккаунт): {html.escape(repr(e))}")
+    elif USER_TARGET_CHAT:
+        results.append("❌ TG #3 (мой аккаунт): не подключён — проверь TG_API_ID / TG_API_HASH / TG_USER_SESSION")
+    else:
+        results.append("⚪ TG #3 (мой аккаунт): не задан")
+
     await update.message.reply_text(
         "🔍 <b>Проверка доступа к чатам:</b>\n\n" + "\n".join(results),
         parse_mode="HTML",
@@ -383,9 +414,11 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"  {'✅' if n in active_channels else '⬜'} {n}"
                     for n in all_channels
                 ) or "  нет каналов"
+                user_state = "🟢 подключён" if user_client else "⚪ не задан/не подключён"
                 await update.message.reply_text(
                     f"✅ <b>Подключено</b>\n\n"
                     f"Discord: <code>{tag}</code>\n"
+                    f"Мой аккаунт (TG #3): {user_state}\n"
                     f"Автопересылка: {status}\n"
                     f"Задержка: {BRIDGE_DELAY_MIN//60}–{BRIDGE_DELAY_MAX//60} мин\n\n"
                     f"Каналы:\n{ch_list}",
@@ -647,7 +680,7 @@ def send_discord_webhook_photo(caption: str, image_bytes: bytes):
     log("✅ Webhook Bee фото")
 
 
-# ── Telegram senders — каждый канал в своём try/except + свой токен ──────────
+# ── Telegram senders (боты) — каждый канал в своём try/except + свой токен ───
 
 async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
     if TARGET_CHAT_ID:
@@ -706,6 +739,104 @@ async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str,
             log(f"❌ TG #2 (Heaven) photo error: {repr(e)}")
 
 
+# ── Отправка от лица моего аккаунта (Telethon) ───────────────────────────────
+
+def _user_target_ref():
+    """@username — строкой, числовой id — числом."""
+    ref = USER_TARGET_CHAT.strip()
+    if ref.startswith("@"):
+        return ref
+    try:
+        return int(ref)
+    except ValueError:
+        return ref
+
+
+async def _resolve_target(client):
+    """
+    Ищем целевой чат. Числовой id требует access_hash из кэша сессии;
+    если его там нет — прогреваем кэш списком диалогов и пробуем снова.
+    """
+    ref = _user_target_ref()
+    try:
+        return await client.get_entity(ref)
+    except Exception as e:
+        log(f"⚠️ Не нашли чат сразу ({repr(e)}), прогреваю кэш диалогов...")
+
+    async for d in client.iter_dialogs():
+        if d.id == ref or (isinstance(ref, str) and getattr(d.entity, "username", None) == ref.lstrip("@")):
+            log("✅ Чат найден через список диалогов")
+            return d.entity
+
+    # последний шанс: кэш прогрет, вдруг теперь резолвится
+    return await client.get_entity(ref)
+
+
+async def user_init(app):
+    """Поднимаем аккаунт на том же event loop, что и бот."""
+    global user_client, user_entity
+    if not (TG_API_ID and TG_API_HASH and TG_USER_SESSION and USER_TARGET_CHAT):
+        log("⚪ Userbot: не настроен — пропуск")
+        return
+    try:
+        client = TelegramClient(StringSession(TG_USER_SESSION), TG_API_ID, TG_API_HASH)
+        client.parse_mode = None       # текст как есть, без markdown-разметки
+        await client.connect()         # НЕ start(): иначе полезет спрашивать код в консоли
+        if not await client.is_user_authorized():
+            log("❌ Userbot: сессия невалидна — перегенерируй TG_USER_SESSION")
+            await client.disconnect()
+            return
+        me = await client.get_me()
+        user_entity = await _resolve_target(client)
+        user_client = client
+        title = getattr(user_entity, "title", USER_TARGET_CHAT)
+        log(f"✅ Userbot подключён: @{me.username or me.first_name} → {title}")
+    except Exception as e:
+        log(f"❌ Userbot init error: {repr(e)}")
+        user_client = None
+
+
+async def user_shutdown(app):
+    if user_client:
+        try:
+            await user_client.disconnect()
+            log("👋 Userbot отключён")
+        except Exception as e:
+            log(f"❌ Userbot shutdown error: {repr(e)}")
+
+
+async def send_user_text(text: str):
+    if not user_client or not user_entity or not text:
+        return
+    try:
+        kwargs = {}
+        if USER_TARGET_TOPIC_ID:
+            kwargs["reply_to"] = USER_TARGET_TOPIC_ID
+        await user_client.send_message(user_entity, text, link_preview=False, **kwargs)
+        log("✅ Sent text to TG #3 (мой аккаунт)")
+    except Exception as e:
+        log(f"❌ TG #3 (мой аккаунт) error: {repr(e)}")
+
+
+async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str]):
+    if not user_client or not user_entity:
+        return
+    # аккаунт — тоже «чужой» клиент, file_id бота ему не подходит → только байты
+    if not img_bytes:
+        log("❌ TG #3 (мой аккаунт): нет байтов фото — пропуск")
+        return
+    try:
+        bio = io.BytesIO(img_bytes)
+        bio.name = "photo.jpg"         # Telethon берёт расширение из имени
+        kwargs = {}
+        if USER_TARGET_TOPIC_ID:
+            kwargs["reply_to"] = USER_TARGET_TOPIC_ID
+        await user_client.send_file(user_entity, bio, caption=caption or "", **kwargs)
+        log("✅ Sent photo to TG #3 (мой аккаунт)")
+    except Exception as e:
+        log(f"❌ TG #3 (мой аккаунт) photo error: {repr(e)}")
+
+
 # ── Handler ───────────────────────────────────────────────────────────────────
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -725,7 +856,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     tg_text = transform_for_telegram(raw_text)
     dc_text = transform_for_discord(raw_text) or ""
 
-    # 1. Скачиваем фото один раз — нужно и для TG #2 (Heaven), и для Discord
+    # 1. Скачиваем фото один раз — нужно для TG #2, TG #3 и Discord
     img_bytes = None
     if msg.photo:
         for attempt in range(3):
@@ -743,13 +874,19 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         if img_bytes is None:
             log("❌ Не удалось скачать фото после 3 попыток")
 
-    # 2. Telegram (оба канала, ошибки не блокируют дальнейшее)
+    # 2. Telegram — боты (ошибки не блокируют дальнейшее)
     if msg.photo:
         await send_tg_photo(context, msg.photo[-1].file_id, tg_text, img_bytes)
     elif tg_text:
         await send_tg_text(context, tg_text)
     else:
         log("⏭ Skip Telegram: empty")
+
+    # 2b. Telegram — от лица моего аккаунта (независимо от ботов)
+    if msg.photo:
+        await send_user_photo(img_bytes, tg_text)
+    elif tg_text:
+        await send_user_text(tg_text)
 
     # 3. Discord webhook Bee (мгновенно)
     if DISCORD_WEBHOOK_URL:
@@ -773,7 +910,13 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def main():
     validate_env()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(user_init)
+        .post_shutdown(user_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start",         cmd_start))
     app.add_handler(CommandHandler("channels",      cmd_channels))
