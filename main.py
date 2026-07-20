@@ -66,7 +66,8 @@ DISCORD_TOKEN              = os.getenv("DISCORD_TOKEN", "")
 # ── Сводка о доставке ────────────────────────────────────────────────────────
 REPORT_ENABLED             = os.getenv("REPORT_ENABLED", "true").lower() == "true"
 REPORT_CHAT_ID             = int(os.getenv("REPORT_CHAT_ID", "0") or "0")
-REPORT_TITLE               = os.getenv("REPORT_TITLE", "BumbleBee")
+REPORT_TITLE               = os.getenv("REPORT_TITLE", "Bee")
+REPORT_ICON                = os.getenv("REPORT_ICON", "🐝")
 REPORT_BLOCKED             = os.getenv("REPORT_BLOCKED", "true").lower() == "true"
 REPORT_TZ_OFFSET           = int(os.getenv("REPORT_TZ_OFFSET", "3") or "3")  # GMT+3
 
@@ -147,7 +148,7 @@ class Report:
         total = sum(len(v) for v in self.sections.values())
         good  = sum(1 for v in self.sections.values() for _, ok, _, _ in v if ok)
 
-        icon = "👽" if good == total else "⚠️"
+        icon = REPORT_ICON if good == total else "⚠️"
         head = f"{icon} <b>{html.escape(REPORT_TITLE)}</b> — доставлено {good}/{total}"
 
         lines = [head]
