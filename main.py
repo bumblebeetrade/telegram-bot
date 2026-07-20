@@ -23,6 +23,7 @@ import asyncio
 import random
 import requests
 import aiohttp
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -61,6 +62,13 @@ DISCORD_WEBHOOK_URL        = os.getenv("DISCORD_WEBHOOK_URL", "")
 DISCORD_WEBHOOK_URL_2      = os.getenv("DISCORD_WEBHOOK_URL_2", "")
 DEBUG                      = os.getenv("DEBUG", "true").lower() == "true"
 DISCORD_TOKEN              = os.getenv("DISCORD_TOKEN", "")
+
+# ── Сводка о доставке ────────────────────────────────────────────────────────
+REPORT_ENABLED             = os.getenv("REPORT_ENABLED", "true").lower() == "true"
+REPORT_CHAT_ID             = int(os.getenv("REPORT_CHAT_ID", "0") or "0")
+REPORT_TITLE               = os.getenv("REPORT_TITLE", "BumbleBee")
+REPORT_BLOCKED             = os.getenv("REPORT_BLOCKED", "true").lower() == "true"
+REPORT_TZ_OFFSET           = int(os.getenv("REPORT_TZ_OFFSET", "3") or "3")  # GMT+3
 
 _admin_raw = os.getenv("ADMIN_ID", "0")
 ADMIN_IDS  = {int(x.strip()) for x in _admin_raw.split(",") if x.strip().isdigit()}
@@ -108,6 +116,102 @@ def log(*args):
 
 def is_admin(update: Update) -> bool:
     return update.effective_user and update.effective_user.id in ADMIN_IDS
+
+
+# ── Сводка о доставке ────────────────────────────────────────────────────────
+
+def _now() -> datetime:
+    return datetime.now(timezone(timedelta(hours=REPORT_TZ_OFFSET)))
+
+
+def _hm() -> str:
+    return _now().strftime("%H:%M")
+
+
+class Report:
+    """Копит результаты по всем таргетам и рендерит одно сообщение в конце."""
+
+    def __init__(self, preview: str = ""):
+        self.sections: dict[str, list[tuple[str, bool, str, str]]] = {}
+        self.order: list[str] = []
+        self.preview = preview
+        self.started = _now()
+
+    def add(self, section: str, label: str, ok: bool, note: str = ""):
+        if section not in self.sections:
+            self.sections[section] = []
+            self.order.append(section)
+        self.sections[section].append((label, ok, note, _hm()))
+
+    def render(self) -> str:
+        total = sum(len(v) for v in self.sections.values())
+        good  = sum(1 for v in self.sections.values() for _, ok, _, _ in v if ok)
+
+        icon = "👽" if good == total else "⚠️"
+        head = f"{icon} <b>{html.escape(REPORT_TITLE)}</b> — доставлено {good}/{total}"
+
+        lines = [head]
+        if self.preview:
+            lines.append(f"<i>{html.escape(self.preview)}</i>")
+
+        for section in self.order:
+            lines.append(f"\n<b>{section}</b>")
+            for label, ok, note, ts in self.sections[section]:
+                mark = "✅" if ok else "❌"
+                row  = f"{mark} {html.escape(label)} · {ts}"
+                if note and not ok:
+                    row += f"\n     └ <i>{html.escape(note)}</i>"
+                lines.append(row)
+
+        elapsed = (_now() - self.started).total_seconds()
+        if elapsed >= 60:
+            lines.append(f"\n<i>заняло {elapsed/60:.1f} мин</i>")
+        else:
+            lines.append(f"\n<i>заняло {elapsed:.0f} сек</i>")
+
+        return "\n".join(lines)
+
+
+def _report_targets() -> list[int]:
+    targets = list(ADMIN_IDS)
+    if REPORT_CHAT_ID:
+        targets.append(REPORT_CHAT_ID)
+    return targets
+
+
+async def _deliver_report(bot: Bot, text: str):
+    for chat_id in _report_targets():
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            log(f"❌ Report → {chat_id}: {repr(e)}")
+
+
+async def send_report(bot: Bot, report: Report):
+    """Шлём сводку админам в личку и/или в отдельный чат."""
+    if not REPORT_ENABLED:
+        return
+    await _deliver_report(bot, report.render())
+
+
+async def send_blocked_report(bot: Bot, raw_text: str, reason: str):
+    """Уведомление о посте, который целиком срезали фильтры."""
+    if not REPORT_ENABLED or not REPORT_BLOCKED:
+        return
+    preview = " / ".join(
+        line.strip() for line in raw_text.splitlines() if line.strip()
+    )[:200] or "(без текста)"
+    text = (
+        f"🚫 <b>Пост отфильтрован</b> · {_hm()}\n"
+        f"<i>{html.escape(preview)}</i>\n\n"
+        f"Причина: <code>{html.escape(reason)}</code>"
+    )
+    await _deliver_report(bot, text)
 
 
 # ── Discord selfbot ───────────────────────────────────────────────────────────
@@ -174,9 +278,18 @@ def _send_webhook_photo(url: str, caption: str, image_bytes: bytes):
     ).raise_for_status()
 
 
-async def delayed_send(text: str, img_bytes: Optional[bytes]):
+async def delayed_send(text: str, img_bytes: Optional[bytes],
+                       report: Optional[Report] = None, bot: Optional[Bot] = None):
     """Задержка 2-3 мин → Rebel Angels webhook → пауза 7-10 сек → selfbot каналы."""
+
+    async def finish():
+        if report and bot:
+            await send_report(bot, report)
+
     if not bridge_enabled:
+        if report:
+            report.add("🤖 Selfbot", "автопересылка выключена", False, "/bridge")
+        await finish()
         return
 
     delay = random.uniform(BRIDGE_DELAY_MIN, BRIDGE_DELAY_MAX)
@@ -184,6 +297,9 @@ async def delayed_send(text: str, img_bytes: Optional[bytes]):
     await asyncio.sleep(delay)
 
     if not bridge_enabled:
+        if report:
+            report.add("🤖 Selfbot", "автопересылка выключена", False, "/bridge")
+        await finish()
         return
 
     if DISCORD_WEBHOOK_URL_2:
@@ -194,8 +310,10 @@ async def delayed_send(text: str, img_bytes: Optional[bytes]):
             elif text:
                 _send_webhook_text(DISCORD_WEBHOOK_URL_2, text)
                 log("✅ Webhook Rebel Angels текст")
+            if report: report.add("🌐 Discord webhook", "Rebel Angels", True)
         except Exception as e:
             log(f"❌ Webhook Rebel Angels error: {repr(e)}")
+            if report: report.add("🌐 Discord webhook", "Rebel Angels", False, str(e)[:60])
 
     if active_channels:
         pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
@@ -203,11 +321,13 @@ async def delayed_send(text: str, img_bytes: Optional[bytes]):
         await asyncio.sleep(pause)
 
     if not DISCORD_TOKEN:
+        await finish()
         return
 
     targets = [(n, all_channels[n]) for n in active_channels if n in all_channels]
     if not targets:
         log("⏭ Selfbot: нет активных каналов")
+        await finish()
         return
 
     for i, (name, channel_id) in enumerate(targets):
@@ -215,10 +335,17 @@ async def delayed_send(text: str, img_bytes: Optional[bytes]):
             pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
             log(f"  ⏸ Пауза {pause:.1f} сек перед {name}")
             await asyncio.sleep(pause)
-        if img_bytes:
-            await discord_send_photo(img_bytes, "photo.jpg", text, channel_id)
-        else:
-            await discord_send_text(text, channel_id)
+        try:
+            if img_bytes:
+                ok = await discord_send_photo(img_bytes, "photo.jpg", text, channel_id)
+            else:
+                ok = await discord_send_text(text, channel_id)
+        except Exception as e:
+            log(f"❌ Selfbot {name} error: {repr(e)}")
+            ok = False
+        if report: report.add("🤖 Selfbot", name, bool(ok))
+
+    await finish()
 
 
 # ── Команды ───────────────────────────────────────────────────────────────────
@@ -430,9 +557,10 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Фильтр ────────────────────────────────────────────────────────────────────
 
-def should_block_entire_post(raw_text: str) -> bool:
+def block_reason(raw_text: str) -> Optional[str]:
+    """Причина, по которой пост режется целиком. None — пост проходит."""
     if not raw_text or len(raw_text.strip()) < 3:
-        return False
+        return None
 
     text = html.unescape(raw_text).lower()
     text = re.sub(r"\s+", " ", text).strip()
@@ -472,29 +600,34 @@ def should_block_entire_post(raw_text: str) -> bool:
         "https://", "http://",
     ]
 
-    if any(phrase in text for phrase in blocked_phrases):
-        return True
+    for phrase in blocked_phrases:
+        if phrase in text:
+            return f"стоп-фраза «{phrase}»"
 
     if re.search(r"t\.me/\S+", text):
-        return True
+        return "ссылка t.me"
 
     if re.search(r"@[a-z_]{4,}", text):
-        return True
+        return "упоминание @username"
 
     if re.search(r"[🎉🎊🥳]{2,}", raw_text):
-        return True
+        return "эмодзи-спам"
 
     if re.search(r"\baum\b", text) and (
         "usdt" in text or "copy" in text or "strategy" in text or "trading" in text
     ):
-        return True
+        return "AUM + копитрейд"
 
     if "username" in text and (
         "copy" in text or "trading" in text or "blofin" in text or "arki" in text
     ):
-        return True
+        return "username + копитрейд"
 
-    return False
+    return None
+
+
+def should_block_entire_post(raw_text: str) -> bool:
+    return block_reason(raw_text) is not None
 
 
 DROP_LINE_PATTERNS = [
@@ -682,7 +815,7 @@ def send_discord_webhook_photo(caption: str, image_bytes: bytes):
 
 # ── Telegram senders (боты) — каждый канал в своём try/except + свой токен ───
 
-async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
+async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str, report: Optional[Report] = None):
     if TARGET_CHAT_ID:
         try:
             kwargs = dict(chat_id=TARGET_CHAT_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -690,8 +823,10 @@ async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
                 kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
             await context.bot.send_message(**kwargs)
             log("✅ Sent text to TG #1")
+            if report: report.add("📱 Telegram", "TG #1", True)
         except Exception as e:
             log(f"❌ TG #1 error: {repr(e)}")
+            if report: report.add("📱 Telegram", "TG #1", False, str(e)[:60])
 
     if TARGET_CHAT_ID_2 and BOT_TOKEN_2:
         try:
@@ -701,12 +836,15 @@ async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str):
                 kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
             await bot2.send_message(**kwargs)
             log("✅ Sent text to TG #2 (Heaven)")
+            if report: report.add("📱 Telegram", "Heaven", True)
         except Exception as e:
             log(f"❌ TG #2 (Heaven) error: {repr(e)}")
+            if report: report.add("📱 Telegram", "Heaven", False, str(e)[:60])
 
 
 async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str,
-                        caption: Optional[str], img_bytes: Optional[bytes] = None):
+                        caption: Optional[str], img_bytes: Optional[bytes] = None,
+                        report: Optional[Report] = None):
     # TG #1 — тот же бот, что принял апдейт → file_id валиден
     if TARGET_CHAT_ID:
         try:
@@ -717,14 +855,17 @@ async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str,
                 kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
             await context.bot.send_photo(**kwargs)
             log("✅ Sent photo to TG #1")
+            if report: report.add("📱 Telegram", "TG #1", True)
         except Exception as e:
             log(f"❌ TG #1 photo error: {repr(e)}")
+            if report: report.add("📱 Telegram", "TG #1", False, str(e)[:60])
 
     # TG #2 (Heaven) — ДРУГОЙ бот: file_id от бота #1 у него невалиден
     # ('Wrong file identifier'), поэтому шлём фото байтами
     if TARGET_CHAT_ID_2 and BOT_TOKEN_2:
         if not img_bytes:
             log("❌ TG #2 (Heaven): нет байтов фото — пропуск (file_id чужого бота слать нельзя)")
+            if report: report.add("📱 Telegram", "Heaven", False, "фото не скачалось")
             return
         try:
             bot2 = Bot(token=BOT_TOKEN_2)
@@ -735,8 +876,10 @@ async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str,
                 kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
             await bot2.send_photo(**kwargs)
             log("✅ Sent photo to TG #2 (Heaven)")
+            if report: report.add("📱 Telegram", "Heaven", True)
         except Exception as e:
             log(f"❌ TG #2 (Heaven) photo error: {repr(e)}")
+            if report: report.add("📱 Telegram", "Heaven", False, str(e)[:60])
 
 
 # ── Отправка от лица моего аккаунта (Telethon) ───────────────────────────────
@@ -805,7 +948,12 @@ async def user_shutdown(app):
             log(f"❌ Userbot shutdown error: {repr(e)}")
 
 
-async def send_user_text(text: str):
+def _user_label() -> str:
+    title = getattr(user_entity, "title", None) or USER_TARGET_CHAT
+    return f"{title} (аккаунт)"
+
+
+async def send_user_text(text: str, report: Optional[Report] = None):
     if not user_client or not user_entity or not text:
         return
     try:
@@ -814,16 +962,20 @@ async def send_user_text(text: str):
             kwargs["reply_to"] = USER_TARGET_TOPIC_ID
         await user_client.send_message(user_entity, text, link_preview=False, **kwargs)
         log("✅ Sent text to TG #3 (мой аккаунт)")
+        if report: report.add("📱 Telegram", _user_label(), True)
     except Exception as e:
         log(f"❌ TG #3 (мой аккаунт) error: {repr(e)}")
+        if report: report.add("📱 Telegram", _user_label(), False, str(e)[:60])
 
 
-async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str]):
+async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str],
+                          report: Optional[Report] = None):
     if not user_client or not user_entity:
         return
     # аккаунт — тоже «чужой» клиент, file_id бота ему не подходит → только байты
     if not img_bytes:
         log("❌ TG #3 (мой аккаунт): нет байтов фото — пропуск")
+        if report: report.add("📱 Telegram", _user_label(), False, "фото не скачалось")
         return
     try:
         bio = io.BytesIO(img_bytes)
@@ -833,8 +985,10 @@ async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str]):
             kwargs["reply_to"] = USER_TARGET_TOPIC_ID
         await user_client.send_file(user_entity, bio, caption=caption or "", **kwargs)
         log("✅ Sent photo to TG #3 (мой аккаунт)")
+        if report: report.add("📱 Telegram", _user_label(), True)
     except Exception as e:
         log(f"❌ TG #3 (мой аккаунт) photo error: {repr(e)}")
+        if report: report.add("📱 Telegram", _user_label(), False, str(e)[:60])
 
 
 # ── Handler ───────────────────────────────────────────────────────────────────
@@ -850,11 +1004,18 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     raw_text = msg.text or msg.caption or ""
     log(f"\n{'='*50}\n📨 Incoming:\n{raw_text[:400]}\n{'='*50}")
 
-    if should_block_entire_post(raw_text):
+    reason = block_reason(raw_text)
+    if reason:
+        log(f"🚫 Пост отфильтрован: {reason}")
+        await send_blocked_report(context.bot, raw_text, reason)
         return
 
     tg_text = transform_for_telegram(raw_text)
     dc_text = transform_for_discord(raw_text) or ""
+
+    # Сводка о доставке — копится по ходу, уходит в самом конце
+    preview = (tg_text or dc_text or "фото").splitlines()[0][:60] if (tg_text or dc_text) else "фото"
+    report  = Report(preview)
 
     # 1. Скачиваем фото один раз — нужно для TG #2, TG #3 и Discord
     img_bytes = None
@@ -876,34 +1037,39 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 2. Telegram — боты (ошибки не блокируют дальнейшее)
     if msg.photo:
-        await send_tg_photo(context, msg.photo[-1].file_id, tg_text, img_bytes)
+        await send_tg_photo(context, msg.photo[-1].file_id, tg_text, img_bytes, report)
     elif tg_text:
-        await send_tg_text(context, tg_text)
+        await send_tg_text(context, tg_text, report)
     else:
         log("⏭ Skip Telegram: empty")
 
     # 2b. Telegram — от лица моего аккаунта (независимо от ботов)
     if msg.photo:
-        await send_user_photo(img_bytes, tg_text)
+        await send_user_photo(img_bytes, tg_text, report)
     elif tg_text:
-        await send_user_text(tg_text)
+        await send_user_text(tg_text, report)
 
     # 3. Discord webhook Bee (мгновенно)
     if DISCORD_WEBHOOK_URL:
         try:
             if img_bytes:
                 send_discord_webhook_photo(dc_text, img_bytes)
+                report.add("🌐 Discord webhook", "Bee", True)
             elif dc_text:
                 send_discord_webhook_text(dc_text)
+                report.add("🌐 Discord webhook", "Bee", True)
         except Exception as e:
             log(f"❌ Webhook Bee error: {repr(e)}")
+            report.add("🌐 Discord webhook", "Bee", False, str(e)[:60])
 
-    # 4. Задержка → Rebel Angels webhook → selfbot каналы (в фоне)
+    # 4. Задержка → Rebel Angels webhook → selfbot каналы (в фоне),
+    #    в самом конце — сводка о доставке
     if not dc_text and not img_bytes:
         log("⏭ Skip delayed: empty")
+        await send_report(context.bot, report)
         return
 
-    asyncio.create_task(delayed_send(dc_text, img_bytes))
+    asyncio.create_task(delayed_send(dc_text, img_bytes, report, context.bot))
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
