@@ -1,6 +1,11 @@
 """
 Telegram → Discord Bridge
-Arki канал: перевод на RU для TG + оригинал в Discord
+
+Языки таргетов:
+  RU  — только TG #1 (Crypto Phoenix)
+  EN  — все остальные: TG #2 (Heaven), TG #3 (мой аккаунт),
+        Discord webhook Bee, Rebel Angels, selfbot каналы
+
 Selfbot с задержкой 2-3 мин → webhook Rebel Angels → каналы с паузами 7-10 сек
 Плюс таргет от лица моего аккаунта (Telethon)
 
@@ -816,27 +821,30 @@ def send_discord_webhook_photo(caption: str, image_bytes: bytes):
 
 # ── Telegram senders (боты) — каждый канал в своём try/except + свой токен ───
 
-async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str, report: Optional[Report] = None):
-    if TARGET_CHAT_ID:
+async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, ru_text: str, en_text: str,
+                       report: Optional[Report] = None):
+    # TG #1 (Crypto Phoenix) — ЕДИНСТВЕННЫЙ таргет на русском
+    if TARGET_CHAT_ID and ru_text:
         try:
-            kwargs = dict(chat_id=TARGET_CHAT_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            kwargs = dict(chat_id=TARGET_CHAT_ID, text=ru_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             if TARGET_MESSAGE_THREAD_ID:
                 kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
             await context.bot.send_message(**kwargs)
-            log("✅ Sent text to TG #1")
+            log("✅ Sent text to TG #1 (RU)")
             if report: report.add("📱 Telegram", "TG #1", True)
         except Exception as e:
             log(f"❌ TG #1 error: {repr(e)}")
             if report: report.add("📱 Telegram", "TG #1", False, str(e)[:60])
 
-    if TARGET_CHAT_ID_2 and BOT_TOKEN_2:
+    # TG #2 (Heaven) — английский оригинал
+    if TARGET_CHAT_ID_2 and BOT_TOKEN_2 and en_text:
         try:
             bot2 = Bot(token=BOT_TOKEN_2)
-            kwargs = dict(chat_id=TARGET_CHAT_ID_2, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            kwargs = dict(chat_id=TARGET_CHAT_ID_2, text=en_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             if TARGET_MESSAGE_THREAD_ID_2:
                 kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
             await bot2.send_message(**kwargs)
-            log("✅ Sent text to TG #2 (Heaven)")
+            log("✅ Sent text to TG #2 (Heaven, EN)")
             if report: report.add("📱 Telegram", "Heaven", True)
         except Exception as e:
             log(f"❌ TG #2 (Heaven) error: {repr(e)}")
@@ -844,25 +852,26 @@ async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, text: str, report: Op
 
 
 async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str,
-                        caption: Optional[str], img_bytes: Optional[bytes] = None,
+                        ru_caption: Optional[str], en_caption: Optional[str],
+                        img_bytes: Optional[bytes] = None,
                         report: Optional[Report] = None):
-    # TG #1 — тот же бот, что принял апдейт → file_id валиден
+    # TG #1 (Crypto Phoenix) — русская подпись, тот же бот → file_id валиден
     if TARGET_CHAT_ID:
         try:
             kwargs = dict(chat_id=TARGET_CHAT_ID, photo=file_id)
-            if caption:
-                kwargs["caption"] = caption
+            if ru_caption:
+                kwargs["caption"] = ru_caption
             if TARGET_MESSAGE_THREAD_ID:
                 kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
             await context.bot.send_photo(**kwargs)
-            log("✅ Sent photo to TG #1")
+            log("✅ Sent photo to TG #1 (RU)")
             if report: report.add("📱 Telegram", "TG #1", True)
         except Exception as e:
             log(f"❌ TG #1 photo error: {repr(e)}")
             if report: report.add("📱 Telegram", "TG #1", False, str(e)[:60])
 
-    # TG #2 (Heaven) — ДРУГОЙ бот: file_id от бота #1 у него невалиден
-    # ('Wrong file identifier'), поэтому шлём фото байтами
+    # TG #2 (Heaven) — английская подпись. ДРУГОЙ бот: file_id от бота #1
+    # у него невалиден ('Wrong file identifier'), поэтому шлём фото байтами
     if TARGET_CHAT_ID_2 and BOT_TOKEN_2:
         if not img_bytes:
             log("❌ TG #2 (Heaven): нет байтов фото — пропуск (file_id чужого бота слать нельзя)")
@@ -871,12 +880,12 @@ async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str,
         try:
             bot2 = Bot(token=BOT_TOKEN_2)
             kwargs = dict(chat_id=TARGET_CHAT_ID_2, photo=img_bytes)
-            if caption:
-                kwargs["caption"] = caption
+            if en_caption:
+                kwargs["caption"] = en_caption
             if TARGET_MESSAGE_THREAD_ID_2:
                 kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
             await bot2.send_photo(**kwargs)
-            log("✅ Sent photo to TG #2 (Heaven)")
+            log("✅ Sent photo to TG #2 (Heaven, EN)")
             if report: report.add("📱 Telegram", "Heaven", True)
         except Exception as e:
             log(f"❌ TG #2 (Heaven) photo error: {repr(e)}")
@@ -1014,8 +1023,9 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     tg_text = transform_for_telegram(raw_text)
     dc_text = transform_for_discord(raw_text) or ""
 
-    # Сводка о доставке — копится по ходу, уходит в самом конце
-    preview = (tg_text or dc_text or "фото").splitlines()[0][:60] if (tg_text or dc_text) else "фото"
+    # Сводка о доставке — копится по ходу, уходит в самом конце.
+    # В превью — английский оригинал (dc_text), русский только запасной вариант.
+    preview = (dc_text or tg_text or "фото").splitlines()[0][:60] if (dc_text or tg_text) else "фото"
     report  = Report(preview)
 
     # 1. Скачиваем фото один раз — нужно для TG #2, TG #3 и Discord
@@ -1036,19 +1046,19 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         if img_bytes is None:
             log("❌ Не удалось скачать фото после 3 попыток")
 
-    # 2. Telegram — боты (ошибки не блокируют дальнейшее)
+    # 2. Telegram — боты. TG #1 на русском, Heaven на английском
     if msg.photo:
-        await send_tg_photo(context, msg.photo[-1].file_id, tg_text, img_bytes, report)
-    elif tg_text:
-        await send_tg_text(context, tg_text, report)
+        await send_tg_photo(context, msg.photo[-1].file_id, tg_text, dc_text, img_bytes, report)
+    elif tg_text or dc_text:
+        await send_tg_text(context, tg_text, dc_text, report)
     else:
         log("⏭ Skip Telegram: empty")
 
-    # 2b. Telegram — от лица моего аккаунта (независимо от ботов)
+    # 2b. Telegram — от лица моего аккаунта. Английский оригинал
     if msg.photo:
-        await send_user_photo(img_bytes, tg_text, report)
-    elif tg_text:
-        await send_user_text(tg_text, report)
+        await send_user_photo(img_bytes, dc_text, report)
+    elif dc_text:
+        await send_user_text(dc_text, report)
 
     # 3. Discord webhook Bee (мгновенно)
     if DISCORD_WEBHOOK_URL:
