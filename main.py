@@ -56,10 +56,16 @@ TARGET_MESSAGE_THREAD_ID   = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0") or "
 TARGET_CHAT_ID_2           = int(os.getenv("TARGET_CHAT_ID_2", "0"))
 TARGET_MESSAGE_THREAD_ID_2 = int(os.getenv("TARGET_MESSAGE_THREAD_ID_2", "0") or "0")
 
-# ── Таргет от лица моего аккаунта (Telethon) ─────────────────────────────────
+# ── Таргеты от лица моего аккаунта (Telethon) ────────────────────────────────
 TG_API_ID                  = int(os.getenv("TG_API_ID", "0") or "0")
 TG_API_HASH                = os.getenv("TG_API_HASH", "")
 TG_USER_SESSION            = os.getenv("TG_USER_SESSION", "")
+
+# Список чатов через запятую. Каждый: chat_id  или  chat_id:topic_id
+#   пример: -1002338492731,-1001234567890:5,@my_group
+# USER_TARGET_CHAT / USER_TARGET_TOPIC_ID оставлены для совместимости
+# (если задан старый одиночный — он добавляется к списку).
+USER_TARGET_CHATS          = os.getenv("USER_TARGET_CHATS", "")
 USER_TARGET_CHAT           = os.getenv("USER_TARGET_CHAT", "")
 USER_TARGET_TOPIC_ID       = int(os.getenv("USER_TARGET_TOPIC_ID", "0") or "0")
 
@@ -102,8 +108,8 @@ all_channels: dict[str, str] = _parse_channels_env()
 active_channels: set[str]    = set(all_channels.keys())
 bridge_enabled: bool          = True
 
-user_client = None   # Telethon-клиент (мой аккаунт)
-user_entity = None   # разрезолвленная целевая группа
+user_client = None            # Telethon-клиент (мой аккаунт)
+user_targets: list = []       # список (entity, topic_id, label) — куда шлём от аккаунта
 
 
 def validate_env():
@@ -406,21 +412,21 @@ async def cmd_checkchats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         results.append("⚪ TG #2: не задан")
 
-    # TG #3 — мой аккаунт (Telethon)
-    if user_client and user_entity:
+    # Мои аккаунт-таргеты (Telethon)
+    if user_client and user_targets:
         try:
             me = await user_client.get_me()
-            title = getattr(user_entity, "title", None) or getattr(user_entity, "username", "?")
-            results.append(
-                f"✅ TG #3 (мой аккаунт @{html.escape(me.username or me.first_name or '?')}): "
-                f"<code>{html.escape(USER_TARGET_CHAT)}</code> (topic {USER_TARGET_TOPIC_ID}) — {html.escape(str(title))}"
-            )
+            handle = html.escape(me.username or me.first_name or "?")
+            results.append(f"✅ Аккаунт @{handle} — чатов: {len(user_targets)}")
+            for _, topic, label in user_targets:
+                extra = f" (topic {topic})" if topic else ""
+                results.append(f"   • {html.escape(label)}{extra}")
         except Exception as e:
-            results.append(f"❌ TG #3 (мой аккаунт): {html.escape(repr(e))}")
-    elif USER_TARGET_CHAT:
-        results.append("❌ TG #3 (мой аккаунт): не подключён — проверь TG_API_ID / TG_API_HASH / TG_USER_SESSION")
+            results.append(f"❌ Аккаунт: {html.escape(repr(e))}")
+    elif _parse_user_targets():
+        results.append("❌ Аккаунт-таргеты: не подключены — проверь TG_API_ID / TG_API_HASH / TG_USER_SESSION")
     else:
-        results.append("⚪ TG #3 (мой аккаунт): не задан")
+        results.append("⚪ Аккаунт-таргеты: не заданы")
 
     await update.message.reply_text(
         "🔍 <b>Проверка доступа к чатам:</b>\n\n" + "\n".join(results),
@@ -547,11 +553,11 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"  {'✅' if n in active_channels else '⬜'} {n}"
                     for n in all_channels
                 ) or "  нет каналов"
-                user_state = "🟢 подключён" if user_client else "⚪ не задан/не подключён"
+                user_state = f"🟢 чатов: {len(user_targets)}" if user_client else "⚪ не задан/не подключён"
                 await update.message.reply_text(
                     f"✅ <b>Подключено</b>\n\n"
                     f"Discord: <code>{tag}</code>\n"
-                    f"Мой аккаунт (TG #3): {user_state}\n"
+                    f"Мой аккаунт: {user_state}\n"
                     f"Автопересылка: {status}\n"
                     f"Задержка: {BRIDGE_DELAY_MIN//60}–{BRIDGE_DELAY_MAX//60} мин\n\n"
                     f"Каналы:\n{ch_list}",
@@ -894,41 +900,73 @@ async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str,
 
 # ── Отправка от лица моего аккаунта (Telethon) ───────────────────────────────
 
-def _user_target_ref():
-    """@username — строкой, числовой id — числом."""
-    ref = USER_TARGET_CHAT.strip()
-    if ref.startswith("@"):
-        return ref
-    try:
-        return int(ref)
-    except ValueError:
-        return ref
+def _parse_user_targets() -> list[tuple]:
+    """
+    Разбираем список чатов-аккаунта в [(ref, topic_id), ...].
+    Источник: USER_TARGET_CHATS (через запятую, каждый chat или chat:topic),
+    плюс старые USER_TARGET_CHAT / USER_TARGET_TOPIC_ID для совместимости.
+    Дубликаты по ref отсеиваются.
+    """
+    raw_parts = []
+    if USER_TARGET_CHATS.strip():
+        raw_parts.extend(USER_TARGET_CHATS.split(","))
+    if USER_TARGET_CHAT.strip():
+        old = USER_TARGET_CHAT.strip()
+        if USER_TARGET_TOPIC_ID:
+            old += f":{USER_TARGET_TOPIC_ID}"
+        raw_parts.append(old)
+
+    result, seen = [], set()
+    for part in raw_parts:
+        part = part.strip()
+        if not part:
+            continue
+        topic = 0
+        # topic указываем через ":", но у @username двоеточий не бывает,
+        # а числовой id отрицательный — режем только последний ":digits"
+        mt = re.match(r"^(.*?):(\d+)$", part)
+        if mt:
+            part, topic = mt.group(1).strip(), int(mt.group(2))
+
+        if part.startswith("@"):
+            ref = part
+        else:
+            try:
+                ref = int(part)
+            except ValueError:
+                ref = part
+
+        key = str(ref)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append((ref, topic))
+    return result
 
 
-async def _resolve_target(client):
+async def _resolve_ref(client, ref):
     """
-    Ищем целевой чат. Числовой id требует access_hash из кэша сессии;
-    если его там нет — прогреваем кэш списком диалогов и пробуем снова.
+    Числовой id требует access_hash из кэша сессии; если его там нет —
+    прогреваем кэш списком диалогов и пробуем снова.
     """
-    ref = _user_target_ref()
     try:
         return await client.get_entity(ref)
     except Exception as e:
-        log(f"⚠️ Не нашли чат сразу ({repr(e)}), прогреваю кэш диалогов...")
+        log(f"⚠️ Чат {ref} не нашёлся сразу ({repr(e)}), прогреваю кэш диалогов...")
 
     async for d in client.iter_dialogs():
         if d.id == ref or (isinstance(ref, str) and getattr(d.entity, "username", None) == ref.lstrip("@")):
-            log("✅ Чат найден через список диалогов")
+            log(f"✅ Чат {ref} найден через список диалогов")
             return d.entity
 
-    # последний шанс: кэш прогрет, вдруг теперь резолвится
     return await client.get_entity(ref)
 
 
 async def user_init(app):
-    """Поднимаем аккаунт на том же event loop, что и бот."""
-    global user_client, user_entity
-    if not (TG_API_ID and TG_API_HASH and TG_USER_SESSION and USER_TARGET_CHAT):
+    """Поднимаем аккаунт на том же event loop, что и бот, резолвим все чаты."""
+    global user_client, user_targets
+    targets_cfg = _parse_user_targets()
+    if not (TG_API_ID and TG_API_HASH and TG_USER_SESSION and targets_cfg):
         log("⚪ Userbot: не настроен — пропуск")
         return
     try:
@@ -940,13 +978,23 @@ async def user_init(app):
             await client.disconnect()
             return
         me = await client.get_me()
-        user_entity = await _resolve_target(client)
         user_client = client
-        title = getattr(user_entity, "title", USER_TARGET_CHAT)
-        log(f"✅ Userbot подключён: @{me.username or me.first_name} → {title}")
+
+        resolved = []
+        for ref, topic in targets_cfg:
+            try:
+                entity = await _resolve_ref(client, ref)
+                title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(ref)
+                resolved.append((entity, topic, f"{title} (аккаунт)"))
+                log(f"✅ Аккаунт-таргет подключён: {title}" + (f" (topic {topic})" if topic else ""))
+            except Exception as e:
+                log(f"❌ Аккаунт-таргет {ref} не подключён: {repr(e)}")
+        user_targets = resolved
+        log(f"✅ Userbot @{me.username or me.first_name}: активных чатов {len(user_targets)}")
     except Exception as e:
         log(f"❌ Userbot init error: {repr(e)}")
         user_client = None
+        user_targets = []
 
 
 async def user_shutdown(app):
@@ -958,47 +1006,46 @@ async def user_shutdown(app):
             log(f"❌ Userbot shutdown error: {repr(e)}")
 
 
-def _user_label() -> str:
-    title = getattr(user_entity, "title", None) or USER_TARGET_CHAT
-    return f"{title} (аккаунт)"
-
-
 async def send_user_text(text: str, report: Optional[Report] = None):
-    if not user_client or not user_entity or not text:
+    if not user_client or not user_targets or not text:
         return
-    try:
-        kwargs = {}
-        if USER_TARGET_TOPIC_ID:
-            kwargs["reply_to"] = USER_TARGET_TOPIC_ID
-        await user_client.send_message(user_entity, text, link_preview=False, **kwargs)
-        log("✅ Sent text to TG #3 (мой аккаунт)")
-        if report: report.add("📱 Telegram", _user_label(), True)
-    except Exception as e:
-        log(f"❌ TG #3 (мой аккаунт) error: {repr(e)}")
-        if report: report.add("📱 Telegram", _user_label(), False, str(e)[:60])
+    for entity, topic, label in user_targets:
+        try:
+            kwargs = {}
+            if topic:
+                kwargs["reply_to"] = topic
+            await user_client.send_message(entity, text, link_preview=False, **kwargs)
+            log(f"✅ Sent text to {label}")
+            if report: report.add("📱 Telegram", label, True)
+        except Exception as e:
+            log(f"❌ {label} error: {repr(e)}")
+            if report: report.add("📱 Telegram", label, False, str(e)[:60])
 
 
 async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str],
                           report: Optional[Report] = None):
-    if not user_client or not user_entity:
+    if not user_client or not user_targets:
         return
     # аккаунт — тоже «чужой» клиент, file_id бота ему не подходит → только байты
     if not img_bytes:
-        log("❌ TG #3 (мой аккаунт): нет байтов фото — пропуск")
-        if report: report.add("📱 Telegram", _user_label(), False, "фото не скачалось")
+        log("❌ Аккаунт-таргеты: нет байтов фото — пропуск")
+        if report:
+            for _, _, label in user_targets:
+                report.add("📱 Telegram", label, False, "фото не скачалось")
         return
-    try:
-        bio = io.BytesIO(img_bytes)
-        bio.name = "photo.jpg"         # Telethon берёт расширение из имени
-        kwargs = {}
-        if USER_TARGET_TOPIC_ID:
-            kwargs["reply_to"] = USER_TARGET_TOPIC_ID
-        await user_client.send_file(user_entity, bio, caption=caption or "", **kwargs)
-        log("✅ Sent photo to TG #3 (мой аккаунт)")
-        if report: report.add("📱 Telegram", _user_label(), True)
-    except Exception as e:
-        log(f"❌ TG #3 (мой аккаунт) photo error: {repr(e)}")
-        if report: report.add("📱 Telegram", _user_label(), False, str(e)[:60])
+    for entity, topic, label in user_targets:
+        try:
+            bio = io.BytesIO(img_bytes)
+            bio.name = "photo.jpg"     # Telethon берёт расширение из имени
+            kwargs = {}
+            if topic:
+                kwargs["reply_to"] = topic
+            await user_client.send_file(entity, bio, caption=caption or "", **kwargs)
+            log(f"✅ Sent photo to {label}")
+            if report: report.add("📱 Telegram", label, True)
+        except Exception as e:
+            log(f"❌ {label} photo error: {repr(e)}")
+            if report: report.add("📱 Telegram", label, False, str(e)[:60])
 
 
 # ── Handler ───────────────────────────────────────────────────────────────────
