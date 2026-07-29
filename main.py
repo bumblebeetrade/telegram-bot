@@ -610,6 +610,52 @@ def block_reason(raw_text: str) -> Optional[str]:
         "no paid/free group", "never dm first", "dm first",
         "telegram",
         "https://", "http://",
+
+        # ── Биржи и платформы (в обычных сигналах не упоминаются) ──
+        "bitunix", "binance", "bybit", "okx", "bitget", "kucoin", "mexc",
+        "gate.io", "gateio", "htx", "huobi", "bingx", "phemex", "deribit",
+        "coinex", "kraken", "coinbase", "bitmex", "bitfinex", "lbank",
+        "pionex", "toobit", "weex", "bitrue", "whitebit", "hyperliquid",
+        "bitmart", "poloniex", "bitstamp", "upbit", "bithumb",
+        "platform", "exchange",
+
+        # ── Рефералки, промокоды, комиссии ──
+        "referral", "referal", "ref link", "ref code",
+        "promo code", "promocode", "bonus code", "use code", "my code",
+        "affiliate", "commission", "management fee",
+        "profit share", "pnl share", "bonus",
+
+        # ── VIP / платные группы, подписки, обучение ──
+        "vip signal", "vip group", "vip channel", "vip member",
+        "premium group", "premium signal", "premium channel",
+        "subscription", "subscribe",
+        "mentorship", "webinar", "masterclass", "academy", "trading course",
+        "lifetime access", "free access", "free signal", "free trial",
+        "prop firm", "funded account",
+
+        # ── Призывы написать / вступить ──
+        "dm me", "pm me", "inbox me", "message me", "text me", "contact me",
+        "reach out", "link in bio", "check bio", "bio link", "in bio",
+        "join now", "join us", "join here", "invite link", "invite you",
+        "my channel", "my group", "our channel", "our group",
+        "trade with me", "trade with us", "copy me", "follow my trades",
+
+        # ── Регистрация на площадках ──
+        "sign up", "signup", "register", "registration",
+        "create account", "open account", "new account",
+
+        # ── Соцсети и мессенджеры ──
+        "discord.gg", "whatsapp", "instagram", "youtube", "tiktok",
+        "facebook", "snapchat",
+
+        # ── Маркетинговое давление ──
+        # NB: слова уточнены — голые "hurry" / "guarantee" / "last chance"
+        # ловили обычные комментарии трейдера («I m not in Hurry...»)
+        "guaranteed profit", "guaranteed return", "risk free",
+        "slots left", "seats left", "spots left",
+        "last chance to join", "limited time offer", "hurry up",
+        "click here", "swipe up", "tap the link",
+        "double your", "10x your",
     ]
 
     for phrase in blocked_phrases:
@@ -622,8 +668,18 @@ def block_reason(raw_text: str) -> Optional[str]:
     if re.search(r"@[a-z_]{4,}", text):
         return "упоминание @username"
 
+    # домен без http:// — «bitunix.com», «partner.blofin»
+    if re.search(
+        r"\b[a-z0-9][a-z0-9-]*\.(com|net|org|io|me|co|xyz|app|link|gg|top|vip|pro|site|online|club|finance)\b",
+        text,
+    ):
+        return "домен без http"
+
     if re.search(r"[🎉🎊🥳]{2,}", raw_text):
         return "эмодзи-спам"
+
+    if re.search(r"[💰💵💸🤑]{2,}", raw_text):
+        return "денежный эмодзи-спам"
 
     if re.search(r"\baum\b", text) and (
         "usdt" in text or "copy" in text or "strategy" in text or "trading" in text
