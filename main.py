@@ -93,6 +93,12 @@ SEND_DELAY_MAX   = 10
 BRIDGE_DELAY_MIN = 120
 BRIDGE_DELAY_MAX = 180
 
+# Slow mode на Discord-серверах (например Bulk Trade — 5 сек).
+# Повторяем ТОЛЬКО при 429; 403/404 повторять нельзя.
+SLOWMODE_RETRIES      = int(os.getenv("SLOWMODE_RETRIES", "4") or "4")
+SLOWMODE_MAX_WAIT     = float(os.getenv("SLOWMODE_MAX_WAIT", "30") or "30")
+SLOWMODE_FALLBACK_WAIT = 5.0
+
 
 def _parse_channels_env() -> dict:
     result = {}
@@ -239,37 +245,75 @@ def discord_headers() -> dict:
     }
 
 
+def _retry_after(body: str) -> float:
+    """Сколько ждать — берём из ответа самого Discord + небольшой разброс,
+    чтобы параллельные отправки не ломились в канал в одну и ту же секунду."""
+    try:
+        val = float(json.loads(body).get("retry_after", SLOWMODE_FALLBACK_WAIT))
+    except Exception:
+        val = SLOWMODE_FALLBACK_WAIT
+    return min(max(val, 1.0) + random.uniform(0.5, 2.0), SLOWMODE_MAX_WAIT)
+
+
+async def _discord_send(build_request, channel_id: str, kind: str) -> bool:
+    """
+    Отправка в канал selfbot'ом.
+
+    Повтор ТОЛЬКО на 429 (slow mode) и ровно на столько, сколько велит
+    Discord. Любая другая ошибка — 403 «нет прав», 404 «нет канала»,
+    обрыв связи — отказ сразу: повторять бессмысленно, а на обрыве ещё
+    и опасно (сообщение могло уйти, повтор дал бы дубль).
+    """
+    url = f"{DISCORD_API}/channels/{channel_id}/messages"
+    try:
+        for attempt in range(1, SLOWMODE_RETRIES + 1):
+            # тело запроса собираем заново на каждую попытку:
+            # aiohttp.FormData одноразовая, повторно её отправить нельзя
+            kwargs = build_request()
+            async with aiohttp.ClientSession() as s:
+                async with s.post(url, **kwargs) as r:
+                    if r.status == 200:
+                        suffix = f" (с {attempt}-й попытки)" if attempt > 1 else ""
+                        log(f"✅ Selfbot {kind} → {channel_id}{suffix}")
+                        return True
+
+                    body = await r.text()
+
+                    if r.status != 429:
+                        log(f"❌ Selfbot {kind} ошибка {r.status}: {body[:200]}")
+                        return False
+
+                    wait = _retry_after(body)
+                    if attempt >= SLOWMODE_RETRIES:
+                        log(f"❌ Selfbot {kind} → {channel_id}: slow mode, "
+                            f"{SLOWMODE_RETRIES} попыток исчерпаны — отмена")
+                        return False
+                    log(f"⏳ Selfbot {kind} → {channel_id}: slow mode, жду {wait:.1f} сек "
+                        f"(попытка {attempt}/{SLOWMODE_RETRIES})")
+                    await asyncio.sleep(wait)
+        return False
+    except Exception as e:
+        log(f"❌ Selfbot {kind} → {channel_id}: {repr(e)}")
+        return False
+
+
 async def discord_send_text(text: str, channel_id: str) -> bool:
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            f"{DISCORD_API}/channels/{channel_id}/messages",
-            json={"content": text},
-            headers=discord_headers(),
-        ) as r:
-            if r.status == 200:
-                log(f"✅ Selfbot текст → {channel_id}")
-                return True
-            log(f"❌ Selfbot ошибка {r.status}: {await r.text()}")
-            return False
+    def build():
+        return dict(json={"content": text}, headers=discord_headers())
+    return await _discord_send(build, channel_id, "текст")
 
 
 async def discord_send_photo(file_bytes: bytes, filename: str, caption: str, channel_id: str) -> bool:
     headers = {k: v for k, v in discord_headers().items() if k != "Content-Type"}
-    form = aiohttp.FormData()
-    if caption:
-        form.add_field("payload_json", json.dumps({"content": caption}), content_type="application/json")
-    form.add_field("files[0]", file_bytes, filename=filename)
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            f"{DISCORD_API}/channels/{channel_id}/messages",
-            data=form,
-            headers=headers,
-        ) as r:
-            if r.status == 200:
-                log(f"✅ Selfbot фото → {channel_id}")
-                return True
-            log(f"❌ Selfbot фото ошибка {r.status}: {await r.text()}")
-            return False
+
+    def build():
+        form = aiohttp.FormData()
+        if caption:
+            form.add_field("payload_json", json.dumps({"content": caption}), content_type="application/json")
+        form.add_field("files[0]", file_bytes, filename=filename)
+        return dict(data=form, headers=headers)
+
+    return await _discord_send(build, channel_id, "фото")
 
 
 def _send_webhook_text(url: str, text: str):
