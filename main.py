@@ -17,6 +17,7 @@ Selfbot с задержкой 2-3 мин → webhook Rebel Angels → канал
   /bridge                      — тумблер автопересылки
   /status                      — статус Discord
   /checkchats                  — диагностика доступа к TG таргетам
+  /mychats [слово]             — ID всех групп подключённых аккаунтов
 """
 
 import os
@@ -428,7 +429,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/removechannel &lt;название&gt; — удалить канал\n"
         "/bridge — тумблер автопересылки\n"
         "/status — статус Discord\n"
-        "/checkchats — диагностика TG таргетов",
+        "/checkchats — диагностика TG таргетов\n"
+        "/mychats — ID всех групп аккаунтов",
         parse_mode="HTML",
     )
 
@@ -485,6 +487,63 @@ async def cmd_checkchats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔍 <b>Проверка доступа к чатам:</b>\n\n" + "\n".join(results),
         parse_mode="HTML",
     )
+
+
+async def _reply_chunks(message, lines: list[str], limit: int = 3500):
+    """Длинный список режем на сообщения — у Telegram лимит 4096 символов."""
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > limit:
+            await message.reply_text(chunk, parse_mode="HTML")
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        await message.reply_text(chunk, parse_mode="HTML")
+
+
+async def cmd_mychats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Список групп/каналов каждого подключённого аккаунта вместе с ID —
+    чтобы не искать ID вручную. /mychats <слово> фильтрует по названию.
+    """
+    if not is_admin(update):
+        return
+
+    if not user_accounts:
+        await update.message.reply_text("⚪ Нет подключённых аккаунтов.")
+        return
+
+    needle = " ".join(ctx.args).strip().lower() if ctx.args else ""
+
+    for acc in user_accounts:
+        # id уже настроенных таргетов — чтобы пометить их галочкой
+        known = {getattr(e, "id", None) for e, _, _ in acc["targets"]}
+
+        header = f"📋 <b>{html.escape(acc['name'])}</b>"
+        if needle:
+            header += f" — поиск «{html.escape(needle)}»"
+        lines, shown = [header, ""], 0
+
+        try:
+            async for d in acc["client"].iter_dialogs():
+                if d.is_user:
+                    continue
+                title = d.name or "?"
+                if needle and needle not in title.lower():
+                    continue
+                shown += 1
+                mark  = "✅" if getattr(d.entity, "id", None) in known else "▫️"
+                forum = " 🧵" if getattr(d.entity, "forum", False) else ""
+                lines.append(f"{mark} {html.escape(title)}{forum}\n<code>{d.id}</code>")
+        except Exception as e:
+            lines.append(f"❌ Ошибка чтения диалогов: {html.escape(repr(e))}")
+
+        if shown == 0:
+            lines.append("(ничего не найдено)")
+        else:
+            lines.append(f"\n<i>всего: {shown} · ✅ уже в таргетах · 🧵 форум (нужен topic id)</i>")
+
+        await _reply_chunks(update.message, lines)
 
 
 async def cmd_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1280,6 +1339,7 @@ def main():
     app.add_handler(CommandHandler("bridge",        cmd_bridge))
     app.add_handler(CommandHandler("status",        cmd_status))
     app.add_handler(CommandHandler("checkchats",    cmd_checkchats))
+    app.add_handler(CommandHandler("mychats",       cmd_mychats))
     app.add_handler(CallbackQueryHandler(cb_ch_toggle,     pattern=r"^chtoggle:"))
     app.add_handler(CallbackQueryHandler(cb_bridge_toggle, pattern=r"^bridge_toggle$"))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
