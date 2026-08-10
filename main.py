@@ -108,7 +108,10 @@ SLOWMODE_MAX_WAIT     = float(os.getenv("SLOWMODE_MAX_WAIT", "30") or "30")
 SLOWMODE_FALLBACK_WAIT = 5.0
 
 # Скачивание фото из Bot API: сколько попыток при таймаутах Telegram
-PHOTO_DL_ATTEMPTS     = int(os.getenv("PHOTO_DL_ATTEMPTS", "5") or "5")
+# (первый заход короткий, чтобы не задерживать конвейер; если не вышло —
+# вторая волна через LATE_PHOTO_WAIT сек досылает всем, кому нужны байты)
+PHOTO_DL_ATTEMPTS     = int(os.getenv("PHOTO_DL_ATTEMPTS", "3") or "3")
+LATE_PHOTO_WAIT       = int(os.getenv("LATE_PHOTO_WAIT", "60") or "60")
 
 
 def _parse_channels_env() -> dict:
@@ -346,14 +349,15 @@ def _send_webhook_photo(url: str, caption: str, image_bytes: bytes):
     ).raise_for_status()
 
 
-async def download_photo(bot: Bot, file_id: str) -> Optional[bytes]:
+async def download_photo(bot: Bot, file_id: str, attempts: int = 0) -> Optional[bytes]:
     """
     Скачиваем фото с ретраями и растущими паузами. get_file иногда
     таймаутит на стороне Telegram по несколько минут подряд, поэтому
-    паузы между попытками растут (3→6→12→24 сек), а таймауты щедрые.
+    паузы между попытками растут (3→6→12→... сек), а таймауты щедрые.
     """
+    attempts = attempts or PHOTO_DL_ATTEMPTS
     delay = 3.0
-    for attempt in range(1, PHOTO_DL_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
             tg_file = await bot.get_file(file_id, read_timeout=60, connect_timeout=20)
             img = await asyncio.to_thread(requests.get, tg_file.file_path, timeout=120)
@@ -362,11 +366,11 @@ async def download_photo(bot: Bot, file_id: str) -> Optional[bytes]:
             log(f"✅ Фото скачано{suffix}")
             return img.content
         except Exception as e:
-            log(f"⚠️ Попытка {attempt}/{PHOTO_DL_ATTEMPTS} скачать фото: {repr(e)}")
-            if attempt < PHOTO_DL_ATTEMPTS:
+            log(f"⚠️ Попытка {attempt}/{attempts} скачать фото: {repr(e)}")
+            if attempt < attempts:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
-    log(f"❌ Не удалось скачать фото после {PHOTO_DL_ATTEMPTS} попыток")
+    log(f"❌ Не удалось скачать фото после {attempts} попыток")
     return None
 
 
@@ -1069,45 +1073,50 @@ async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, ru_text: str, en_text
             if report: report.add("📱 Telegram", "Heaven", False, str(e)[:60])
 
 
-async def send_tg_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str,
-                        ru_caption: Optional[str], en_caption: Optional[str],
-                        img_bytes: Optional[bytes] = None,
-                        report: Optional[Report] = None):
-    # TG #1 (Crypto Phoenix) — русская подпись, тот же бот → file_id валиден
-    if TARGET_CHAT_ID:
-        try:
-            kwargs = dict(chat_id=TARGET_CHAT_ID, photo=file_id)
-            if ru_caption:
-                kwargs["caption"] = ru_caption
-            if TARGET_MESSAGE_THREAD_ID:
-                kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
-            await context.bot.send_photo(**kwargs)
-            log("✅ Sent photo to TG #1 (RU)")
-            if report: report.add("📱 Telegram", "TG #1", True)
-        except Exception as e:
-            log(f"❌ TG #1 photo error: {repr(e)}")
-            if report: report.add("📱 Telegram", "TG #1", False, str(e)[:60])
+async def send_tg_photo_main(context: ContextTypes.DEFAULT_TYPE, file_id: str,
+                             ru_caption: Optional[str],
+                             report: Optional[Report] = None):
+    # TG #1 (Crypto Phoenix) — русская подпись, тот же бот → file_id валиден,
+    # скачивание байтов не нужно: шлём сразу, не дожидаясь download_photo
+    if not TARGET_CHAT_ID:
+        return
+    try:
+        kwargs = dict(chat_id=TARGET_CHAT_ID, photo=file_id)
+        if ru_caption:
+            kwargs["caption"] = ru_caption
+        if TARGET_MESSAGE_THREAD_ID:
+            kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
+        await context.bot.send_photo(**kwargs)
+        log("✅ Sent photo to TG #1 (RU)")
+        if report: report.add("📱 Telegram", "TG #1", True)
+    except Exception as e:
+        log(f"❌ TG #1 photo error: {repr(e)}")
+        if report: report.add("📱 Telegram", "TG #1", False, str(e)[:60])
 
+
+async def send_tg_photo_heaven(en_caption: Optional[str], img_bytes: Optional[bytes],
+                               report: Optional[Report] = None):
     # TG #2 (Heaven) — английская подпись. ДРУГОЙ бот: file_id от бота #1
     # у него невалиден ('Wrong file identifier'), поэтому шлём фото байтами
-    if TARGET_CHAT_ID_2 and BOT_TOKEN_2:
-        if not img_bytes:
-            log("❌ TG #2 (Heaven): нет байтов фото — пропуск (file_id чужого бота слать нельзя)")
-            if report: report.add("📱 Telegram", "Heaven", False, "фото не скачалось")
-            return
-        try:
-            bot2 = Bot(token=BOT_TOKEN_2)
-            kwargs = dict(chat_id=TARGET_CHAT_ID_2, photo=img_bytes)
-            if en_caption:
-                kwargs["caption"] = en_caption
-            if TARGET_MESSAGE_THREAD_ID_2:
-                kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
-            await bot2.send_photo(**kwargs)
-            log("✅ Sent photo to TG #2 (Heaven, EN)")
-            if report: report.add("📱 Telegram", "Heaven", True)
-        except Exception as e:
-            log(f"❌ TG #2 (Heaven) photo error: {repr(e)}")
-            if report: report.add("📱 Telegram", "Heaven", False, str(e)[:60])
+    if not (TARGET_CHAT_ID_2 and BOT_TOKEN_2):
+        return
+    if not img_bytes:
+        log("❌ TG #2 (Heaven): нет байтов фото — пропуск (file_id чужого бота слать нельзя)")
+        if report: report.add("📱 Telegram", "Heaven", False, "фото не скачалось")
+        return
+    try:
+        bot2 = Bot(token=BOT_TOKEN_2)
+        kwargs = dict(chat_id=TARGET_CHAT_ID_2, photo=img_bytes)
+        if en_caption:
+            kwargs["caption"] = en_caption
+        if TARGET_MESSAGE_THREAD_ID_2:
+            kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
+        await bot2.send_photo(**kwargs)
+        log("✅ Sent photo to TG #2 (Heaven, EN)")
+        if report: report.add("📱 Telegram", "Heaven", True)
+    except Exception as e:
+        log(f"❌ TG #2 (Heaven) photo error: {repr(e)}")
+        if report: report.add("📱 Telegram", "Heaven", False, str(e)[:60])
 
 
 # ── Отправка от лица моего аккаунта (Telethon) ───────────────────────────────
@@ -1277,6 +1286,46 @@ async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str],
                 if report: report.add("📱 Telegram", label, False, str(e)[:60])
 
 
+async def late_photo_wave(bot: Bot, file_id: str, dc_text: str,
+                          report: Optional[Report] = None):
+    """
+    Вторая волна: фото не скачалось с первого захода (Telegram лагал).
+    Ждём, пробуем снова с длинной серией ретраев и догоняем все таргеты,
+    которым нужны байты: Heaven, аккаунты, webhook Bee — а затем обычный
+    отложенный конвейер (Rebel Angels + selfbot). TG #1 к этому моменту
+    уже получил фото по file_id.
+    """
+    log(f"🔁 Вторая волна фото через {LATE_PHOTO_WAIT} сек...")
+    await asyncio.sleep(LATE_PHOTO_WAIT)
+    img_bytes = await download_photo(bot, file_id, attempts=5)
+
+    # None оба сендера обрабатывают сами: лог + ❌ в сводке
+    await send_tg_photo_heaven(dc_text, img_bytes, report)
+    await send_user_photo(img_bytes, dc_text, report)
+
+    if DISCORD_WEBHOOK_URL:
+        try:
+            if img_bytes:
+                send_discord_webhook_photo(dc_text, img_bytes)
+                if report: report.add("🌐 Discord webhook", "Bee", True)
+            elif dc_text:
+                send_discord_webhook_text(dc_text)
+                if report: report.add("🌐 Discord webhook", "Bee", True)
+        except Exception as e:
+            log(f"❌ Webhook Bee error: {repr(e)}")
+            if report: report.add("🌐 Discord webhook", "Bee", False, str(e)[:60])
+
+    if not dc_text and not img_bytes:
+        log("⏭ Вторая волна: фото так и не скачалось, текста нет — стоп")
+        if report:
+            await send_report(bot, report)
+        return
+
+    # file_id передаём дальше: delayed_send сможет попробовать докачать
+    # ещё раз после своей задержки 2-3 мин
+    await delayed_send(dc_text, img_bytes, report, bot, file_id)
+
+
 # ── Handler ───────────────────────────────────────────────────────────────────
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1304,20 +1353,24 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     preview = (dc_text or tg_text or "фото").splitlines()[0][:60] if (dc_text or tg_text) else "фото"
     report  = Report(preview)
 
-    # 1. Скачиваем фото один раз — нужно для TG #2, TG #3 и Discord
+    # 1-2. Фото: TG #1 сразу по file_id (ему скачивание не нужно), потом
+    # качаем байты для остальных. Не скачалось — вторую волну в фон и выходим:
+    # она догонит Heaven, аккаунты, webhook Bee и отложенный конвейер.
     img_bytes = None
     if msg.photo:
-        img_bytes = await download_photo(context.bot, msg.photo[-1].file_id)
-
-    # 2. Telegram — боты. TG #1 на русском, Heaven на английском
-    if msg.photo:
-        await send_tg_photo(context, msg.photo[-1].file_id, tg_text, dc_text, img_bytes, report)
+        file_id = msg.photo[-1].file_id
+        await send_tg_photo_main(context, file_id, tg_text, report)
+        img_bytes = await download_photo(context.bot, file_id)
+        if img_bytes is None:
+            asyncio.create_task(late_photo_wave(context.bot, file_id, dc_text, report))
+            return
+        await send_tg_photo_heaven(dc_text, img_bytes, report)
     elif tg_text or dc_text:
         await send_tg_text(context, tg_text, dc_text, report)
     else:
         log("⏭ Skip Telegram: empty")
 
-    # 2b. Telegram — от лица моего аккаунта. Английский оригинал
+    # 2b. Telegram — от лица моих аккаунтов. Английский оригинал
     if msg.photo:
         await send_user_photo(img_bytes, dc_text, report)
     elif dc_text:
