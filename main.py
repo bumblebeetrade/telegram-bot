@@ -107,6 +107,9 @@ SLOWMODE_RETRIES      = int(os.getenv("SLOWMODE_RETRIES", "4") or "4")
 SLOWMODE_MAX_WAIT     = float(os.getenv("SLOWMODE_MAX_WAIT", "30") or "30")
 SLOWMODE_FALLBACK_WAIT = 5.0
 
+# Скачивание фото из Bot API: сколько попыток при таймаутах Telegram
+PHOTO_DL_ATTEMPTS     = int(os.getenv("PHOTO_DL_ATTEMPTS", "5") or "5")
+
 
 def _parse_channels_env() -> dict:
     result = {}
@@ -343,8 +346,33 @@ def _send_webhook_photo(url: str, caption: str, image_bytes: bytes):
     ).raise_for_status()
 
 
+async def download_photo(bot: Bot, file_id: str) -> Optional[bytes]:
+    """
+    Скачиваем фото с ретраями и растущими паузами. get_file иногда
+    таймаутит на стороне Telegram по несколько минут подряд, поэтому
+    паузы между попытками растут (3→6→12→24 сек), а таймауты щедрые.
+    """
+    delay = 3.0
+    for attempt in range(1, PHOTO_DL_ATTEMPTS + 1):
+        try:
+            tg_file = await bot.get_file(file_id, read_timeout=60, connect_timeout=20)
+            img = await asyncio.to_thread(requests.get, tg_file.file_path, timeout=120)
+            img.raise_for_status()
+            suffix = f" (с {attempt}-й попытки)" if attempt > 1 else ""
+            log(f"✅ Фото скачано{suffix}")
+            return img.content
+        except Exception as e:
+            log(f"⚠️ Попытка {attempt}/{PHOTO_DL_ATTEMPTS} скачать фото: {repr(e)}")
+            if attempt < PHOTO_DL_ATTEMPTS:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
+    log(f"❌ Не удалось скачать фото после {PHOTO_DL_ATTEMPTS} попыток")
+    return None
+
+
 async def delayed_send(text: str, img_bytes: Optional[bytes],
-                       report: Optional[Report] = None, bot: Optional[Bot] = None):
+                       report: Optional[Report] = None, bot: Optional[Bot] = None,
+                       photo_file_id: Optional[str] = None):
     """Задержка 2-3 мин → Rebel Angels webhook → пауза 7-10 сек → selfbot каналы."""
 
     async def finish():
@@ -364,6 +392,17 @@ async def delayed_send(text: str, img_bytes: Optional[bytes],
     if not bridge_enabled:
         if report:
             report.add("🤖 Selfbot", "автопересылка выключена", False, "/bridge")
+        await finish()
+        return
+
+    # фото могло не скачаться сразу (Telegram таймаутил) — спустя
+    # 2-3 мин задержки пробуем ещё раз, обычно API уже отвечает
+    if img_bytes is None and photo_file_id and bot:
+        log("🔁 Повторная попытка скачать фото для отложенной отправки...")
+        img_bytes = await download_photo(bot, photo_file_id)
+
+    if not text and not img_bytes:
+        log("⏭ Delayed: фото так и не скачалось, текста нет — пропуск")
         await finish()
         return
 
@@ -1268,20 +1307,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 1. Скачиваем фото один раз — нужно для TG #2, TG #3 и Discord
     img_bytes = None
     if msg.photo:
-        for attempt in range(3):
-            try:
-                tg_file = await context.bot.get_file(msg.photo[-1].file_id)
-                img = requests.get(tg_file.file_path, timeout=120)
-                img.raise_for_status()
-                img_bytes = img.content
-                log("✅ Фото скачано")
-                break
-            except Exception as e:
-                log(f"⚠️ Попытка {attempt+1}/3 скачать фото: {repr(e)}")
-                if attempt < 2:
-                    await asyncio.sleep(5)
-        if img_bytes is None:
-            log("❌ Не удалось скачать фото после 3 попыток")
+        img_bytes = await download_photo(context.bot, msg.photo[-1].file_id)
 
     # 2. Telegram — боты. TG #1 на русском, Heaven на английском
     if msg.photo:
@@ -1311,13 +1337,15 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             report.add("🌐 Discord webhook", "Bee", False, str(e)[:60])
 
     # 4. Задержка → Rebel Angels webhook → selfbot каналы (в фоне),
-    #    в самом конце — сводка о доставке
-    if not dc_text and not img_bytes:
+    #    в самом конце — сводка о доставке. Если фото не скачалось,
+    #    file_id даёт delayed_send шанс докачать его после задержки.
+    photo_file_id = msg.photo[-1].file_id if msg.photo else None
+    if not dc_text and not img_bytes and not photo_file_id:
         log("⏭ Skip delayed: empty")
         await send_report(context.bot, report)
         return
 
-    asyncio.create_task(delayed_send(dc_text, img_bytes, report, context.bot))
+    asyncio.create_task(delayed_send(dc_text, img_bytes, report, context.bot, photo_file_id))
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
