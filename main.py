@@ -98,8 +98,8 @@ _channels_raw = os.getenv("DISCORD_CHANNELS", "")
 DISCORD_API      = "https://discord.com/api/v9"
 SEND_DELAY_MIN   = 7
 SEND_DELAY_MAX   = 10
-BRIDGE_DELAY_MIN = 60
-BRIDGE_DELAY_MAX = 60
+BRIDGE_DELAY_MIN = 48
+BRIDGE_DELAY_MAX = 72
 
 # Slow mode на Discord-серверах (например Bulk Trade — 5 сек).
 # Повторяем ТОЛЬКО при 429; 403/404 повторять нельзя.
@@ -466,7 +466,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📡 <b>Signal Bot</b>\n\n"
         f"Автопересылка: {status}\n"
         f"Активных каналов: {len(active_channels)} из {len(all_channels)}\n"
-        f"Задержка: {BRIDGE_DELAY_MIN//60}–{BRIDGE_DELAY_MAX//60} мин\n\n"
+        f"Задержка: {BRIDGE_DELAY_MIN}–{BRIDGE_DELAY_MAX} сек\n\n"
         "/channels — каналы (вкл/выкл)\n"
         "/addchannel &lt;название&gt; &lt;id&gt; — добавить канал\n"
         "/removechannel &lt;название&gt; — удалить канал\n"
@@ -667,7 +667,7 @@ async def cmd_bridge(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     label = "🟢 Вкл" if bridge_enabled else "🔴 Выкл"
     await update.message.reply_text(
-        f"🌉 <b>Автопересылка в Discord</b>\n\nСтатус: {label}\nЗадержка: {BRIDGE_DELAY_MIN//60}–{BRIDGE_DELAY_MAX//60} мин",
+        f"🌉 <b>Автопересылка в Discord</b>\n\nСтатус: {label}\nЗадержка: {BRIDGE_DELAY_MIN}–{BRIDGE_DELAY_MAX} сек",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data="bridge_toggle")]]),
         parse_mode="HTML",
     )
@@ -683,7 +683,7 @@ async def cb_bridge_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     label = "🟢 Вкл" if bridge_enabled else "🔴 Выкл"
     await query.answer("Включено ✅" if bridge_enabled else "Выключено ❌")
     await query.edit_message_text(
-        f"🌉 <b>Автопересылка в Discord</b>\n\nСтатус: {label}\nЗадержка: {BRIDGE_DELAY_MIN//60}–{BRIDGE_DELAY_MAX//60} мин",
+        f"🌉 <b>Автопересылка в Discord</b>\n\nСтатус: {label}\nЗадержка: {BRIDGE_DELAY_MIN}–{BRIDGE_DELAY_MAX} сек",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data="bridge_toggle")]]),
         parse_mode="HTML",
     )
@@ -719,7 +719,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"Discord: <code>{tag}</code>\n"
                     f"Аккаунты (чатов): {user_state}\n"
                     f"Автопересылка: {status}\n"
-                    f"Задержка: {BRIDGE_DELAY_MIN//60}–{BRIDGE_DELAY_MAX//60} мин\n\n"
+                    f"Задержка: {BRIDGE_DELAY_MIN}–{BRIDGE_DELAY_MAX} сек\n\n"
                     f"Каналы:\n{ch_list}",
                     parse_mode="HTML",
                 )
