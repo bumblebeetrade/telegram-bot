@@ -98,8 +98,8 @@ _channels_raw = os.getenv("DISCORD_CHANNELS", "")
 DISCORD_API      = "https://discord.com/api/v9"
 SEND_DELAY_MIN   = 7
 SEND_DELAY_MAX   = 10
-BRIDGE_DELAY_MIN = 120
-BRIDGE_DELAY_MAX = 180
+BRIDGE_DELAY_MIN = 60
+BRIDGE_DELAY_MAX = 60
 
 # Slow mode на Discord-серверах (например Bulk Trade — 5 сек).
 # Повторяем ТОЛЬКО при 429; 403/404 повторять нельзя.
