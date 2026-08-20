@@ -6,8 +6,8 @@ Telegram → Discord Bridge
   EN  — все остальные: TG #2 (Heaven), TG #3 (мой аккаунт),
         Discord webhook Bee, Rebel Angels, selfbot каналы
 
-Selfbot с задержкой 48-72 сек → каналы с паузами 7-10 сек → сводка →
-webhook Rebel Angels (последним, в сводку не входит)
+Selfbot с задержкой 48-72 сек → каналы с паузами 7-10 сек →
+webhook Rebel Angels → сводка в самом конце
 Плюс таргеты от лица моих аккаунтов (Telethon)
 
 Команды:
@@ -378,7 +378,7 @@ async def download_photo(bot: Bot, file_id: str, attempts: int = 0) -> Optional[
 async def delayed_send(text: str, img_bytes: Optional[bytes],
                        report: Optional[Report] = None, bot: Optional[Bot] = None,
                        photo_file_id: Optional[str] = None):
-    """Задержка 48-72 сек → selfbot каналы (паузы 7-10 сек) → сводка → пауза → Rebel Angels."""
+    """Задержка 48-72 сек → selfbot каналы (паузы 7-10 сек) → пауза → Rebel Angels → сводка."""
 
     async def finish():
         if report and bot:
@@ -431,11 +431,7 @@ async def delayed_send(text: str, img_bytes: Optional[bytes],
                 ok = False
             if report: report.add("🤖 Selfbot", name, bool(ok))
 
-    # 2. Сводка о доставке
-    await finish()
-
-    # 3. Webhook Rebel Angels — в самом конце, после сводки.
-    #    В сводку его результат уже не попадает — статус только в логах.
+    # 2. Webhook Rebel Angels — после selfbot-каналов
     if DISCORD_WEBHOOK_URL_2:
         pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
         log(f"⏸ Пауза {pause:.1f} сек перед Rebel Angels...")
@@ -447,8 +443,13 @@ async def delayed_send(text: str, img_bytes: Optional[bytes],
             elif text:
                 _send_webhook_text(DISCORD_WEBHOOK_URL_2, text)
                 log("✅ Webhook Rebel Angels текст")
+            if report: report.add("🌐 Discord webhook", "Rebel Angels", True)
         except Exception as e:
             log(f"❌ Webhook Rebel Angels error: {repr(e)}")
+            if report: report.add("🌐 Discord webhook", "Rebel Angels", False, str(e)[:60])
+
+    # 3. Сводка о доставке — в самом конце, когда всё отправлено
+    await finish()
 
 
 # ── Команды ───────────────────────────────────────────────────────────────────
