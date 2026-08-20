@@ -6,8 +6,9 @@ Telegram → Discord Bridge
   EN  — все остальные: TG #2 (Heaven), TG #3 (мой аккаунт),
         Discord webhook Bee, Rebel Angels, selfbot каналы
 
-Selfbot с задержкой 2-3 мин → webhook Rebel Angels → каналы с паузами 7-10 сек
-Плюс таргет от лица моего аккаунта (Telethon)
+Selfbot с задержкой 48-72 сек → каналы с паузами 7-10 сек → сводка →
+webhook Rebel Angels (последним, в сводку не входит)
+Плюс таргеты от лица моих аккаунтов (Telethon)
 
 Команды:
   /start
@@ -377,7 +378,7 @@ async def download_photo(bot: Bot, file_id: str, attempts: int = 0) -> Optional[
 async def delayed_send(text: str, img_bytes: Optional[bytes],
                        report: Optional[Report] = None, bot: Optional[Bot] = None,
                        photo_file_id: Optional[str] = None):
-    """Задержка 2-3 мин → Rebel Angels webhook → пауза 7-10 сек → selfbot каналы."""
+    """Задержка 48-72 сек → selfbot каналы (паузы 7-10 сек) → сводка → пауза → Rebel Angels."""
 
     async def finish():
         if report and bot:
@@ -410,7 +411,35 @@ async def delayed_send(text: str, img_bytes: Optional[bytes],
         await finish()
         return
 
+    # 1. Selfbot-каналы (паузы 7-10 сек между ними)
+    if DISCORD_TOKEN:
+        targets = [(n, all_channels[n]) for n in active_channels if n in all_channels]
+        if not targets:
+            log("⏭ Selfbot: нет активных каналов")
+        for i, (name, channel_id) in enumerate(targets):
+            if i > 0:
+                pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
+                log(f"  ⏸ Пауза {pause:.1f} сек перед {name}")
+                await asyncio.sleep(pause)
+            try:
+                if img_bytes:
+                    ok = await discord_send_photo(img_bytes, "photo.jpg", text, channel_id)
+                else:
+                    ok = await discord_send_text(text, channel_id)
+            except Exception as e:
+                log(f"❌ Selfbot {name} error: {repr(e)}")
+                ok = False
+            if report: report.add("🤖 Selfbot", name, bool(ok))
+
+    # 2. Сводка о доставке
+    await finish()
+
+    # 3. Webhook Rebel Angels — в самом конце, после сводки.
+    #    В сводку его результат уже не попадает — статус только в логах.
     if DISCORD_WEBHOOK_URL_2:
+        pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
+        log(f"⏸ Пауза {pause:.1f} сек перед Rebel Angels...")
+        await asyncio.sleep(pause)
         try:
             if img_bytes:
                 _send_webhook_photo(DISCORD_WEBHOOK_URL_2, text, img_bytes)
@@ -418,42 +447,8 @@ async def delayed_send(text: str, img_bytes: Optional[bytes],
             elif text:
                 _send_webhook_text(DISCORD_WEBHOOK_URL_2, text)
                 log("✅ Webhook Rebel Angels текст")
-            if report: report.add("🌐 Discord webhook", "Rebel Angels", True)
         except Exception as e:
             log(f"❌ Webhook Rebel Angels error: {repr(e)}")
-            if report: report.add("🌐 Discord webhook", "Rebel Angels", False, str(e)[:60])
-
-    if active_channels:
-        pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
-        log(f"⏸ Пауза {pause:.1f} сек перед selfbot каналами...")
-        await asyncio.sleep(pause)
-
-    if not DISCORD_TOKEN:
-        await finish()
-        return
-
-    targets = [(n, all_channels[n]) for n in active_channels if n in all_channels]
-    if not targets:
-        log("⏭ Selfbot: нет активных каналов")
-        await finish()
-        return
-
-    for i, (name, channel_id) in enumerate(targets):
-        if i > 0:
-            pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
-            log(f"  ⏸ Пауза {pause:.1f} сек перед {name}")
-            await asyncio.sleep(pause)
-        try:
-            if img_bytes:
-                ok = await discord_send_photo(img_bytes, "photo.jpg", text, channel_id)
-            else:
-                ok = await discord_send_text(text, channel_id)
-        except Exception as e:
-            log(f"❌ Selfbot {name} error: {repr(e)}")
-            ok = False
-        if report: report.add("🤖 Selfbot", name, bool(ok))
-
-    await finish()
 
 
 # ── Команды ───────────────────────────────────────────────────────────────────
