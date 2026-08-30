@@ -19,6 +19,7 @@ webhook Rebel Angels → сводка в самом конце
   /status                      — статус Discord
   /checkchats                  — диагностика доступа к TG таргетам
   /mychats [слово]             — ID всех групп подключённых аккаунтов
+  /posts                       — последние посты, удаление разом во всех таргетах
 """
 
 import os
@@ -30,6 +31,7 @@ import asyncio
 import random
 import requests
 import aiohttp
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -114,6 +116,10 @@ SLOWMODE_FALLBACK_WAIT = 5.0
 PHOTO_DL_ATTEMPTS     = int(os.getenv("PHOTO_DL_ATTEMPTS", "3") or "3")
 LATE_PHOTO_WAIT       = int(os.getenv("LATE_PHOTO_WAIT", "60") or "60")
 
+# Сколько последних пересланных постов помнить для /posts (удаление везде).
+# Хранится только в памяти процесса: несколько КБ, диск не используется.
+POSTS_KEEP            = int(os.getenv("POSTS_KEEP", "15") or "15")
+
 
 def _parse_channels_env() -> dict:
     result = {}
@@ -132,6 +138,31 @@ bridge_enabled: bool          = True
 # Все подключённые Telethon-аккаунты:
 # [{"name": "BumbleBee", "client": ..., "targets": [(entity, topic_id, label), ...]}, ...]
 user_accounts: list = []
+
+# Последние пересланные посты: каждый — «связка» ID отправленных сообщений
+# по всем таргетам, чтобы /posts мог удалить пост разом везде.
+# deque с maxlen: старые связки вытесняются сами, память не растёт.
+sent_posts: deque = deque(maxlen=POSTS_KEEP)
+_post_seq: int = 0
+
+
+def new_bundle(preview: str) -> dict:
+    global _post_seq
+    _post_seq += 1
+    b = {
+        "uid": _post_seq,
+        "time": _now().strftime("%d.%m %H:%M"),
+        "preview": (preview or "фото")[:60],
+        "items": [],        # [{"kind","label","refs"}]
+        "deleted": False,   # True — пост удалён (и отменяет отложенные отправки)
+    }
+    sent_posts.append(b)
+    return b
+
+
+def bundle_add(bundle: Optional[dict], kind: str, label: str, *refs):
+    if bundle is not None:
+        bundle["items"].append({"kind": kind, "label": label, "refs": refs})
 
 
 def validate_env():
@@ -291,7 +322,12 @@ async def _discord_send(build_request, channel_id: str, kind: str) -> bool:
                     if r.status == 200:
                         suffix = f" (с {attempt}-й попытки)" if attempt > 1 else ""
                         log(f"✅ Selfbot {kind} → {channel_id}{suffix}")
-                        return True
+                        # id сообщения нужен для /posts (удаление);
+                        # truthy-строка, так что bool(ok) у вызывающих не ломается
+                        try:
+                            return (await r.json()).get("id") or True
+                        except Exception:
+                            return True
 
                     body = await r.text()
 
@@ -332,22 +368,36 @@ async def discord_send_photo(file_bytes: bytes, filename: str, caption: str, cha
     return await _discord_send(build, channel_id, "фото")
 
 
-def _send_webhook_text(url: str, text: str):
+def _send_webhook_text(url: str, text: str) -> list:
+    """Возвращает id отправленных сообщений (wait=true) — для /posts."""
+    ids = []
     if not url:
-        return
+        return ids
     for part in split_text(text):
-        requests.post(url, json={"content": part}, timeout=30).raise_for_status()
+        r = requests.post(url, params={"wait": "true"}, json={"content": part}, timeout=30)
+        r.raise_for_status()
+        try:
+            ids.append(r.json()["id"])
+        except Exception:
+            pass
+    return ids
 
 
-def _send_webhook_photo(url: str, caption: str, image_bytes: bytes):
+def _send_webhook_photo(url: str, caption: str, image_bytes: bytes) -> list:
     if not url:
-        return
-    requests.post(
+        return []
+    r = requests.post(
         url,
+        params={"wait": "true"},
         data={"payload_json": json.dumps({"content": caption or ""}, ensure_ascii=False)},
         files={"files[0]": ("photo.png", image_bytes, "image/png")},
         timeout=60,
-    ).raise_for_status()
+    )
+    r.raise_for_status()
+    try:
+        return [r.json()["id"]]
+    except Exception:
+        return []
 
 
 async def download_photo(bot: Bot, file_id: str, attempts: int = 0) -> Optional[bytes]:
@@ -377,8 +427,12 @@ async def download_photo(bot: Bot, file_id: str, attempts: int = 0) -> Optional[
 
 async def delayed_send(text: str, img_bytes: Optional[bytes],
                        report: Optional[Report] = None, bot: Optional[Bot] = None,
-                       photo_file_id: Optional[str] = None):
+                       photo_file_id: Optional[str] = None,
+                       bundle: Optional[dict] = None):
     """Задержка 48-72 сек → selfbot каналы (паузы 7-10 сек) → пауза → Rebel Angels → сводка."""
+
+    def cancelled() -> bool:
+        return bool(bundle and bundle["deleted"])
 
     async def finish():
         if report and bot:
@@ -411,12 +465,19 @@ async def delayed_send(text: str, img_bytes: Optional[bytes],
         await finish()
         return
 
+    if cancelled():
+        log("🛑 Пост удалён через /posts — отложенная отправка отменена")
+        return
+
     # 1. Selfbot-каналы (паузы 7-10 сек между ними)
     if DISCORD_TOKEN:
         targets = [(n, all_channels[n]) for n in active_channels if n in all_channels]
         if not targets:
             log("⏭ Selfbot: нет активных каналов")
         for i, (name, channel_id) in enumerate(targets):
+            if cancelled():
+                log("🛑 Пост удалён через /posts — остаток selfbot-очереди отменён")
+                return
             if i > 0:
                 pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
                 log(f"  ⏸ Пауза {pause:.1f} сек перед {name}")
@@ -429,27 +490,33 @@ async def delayed_send(text: str, img_bytes: Optional[bytes],
             except Exception as e:
                 log(f"❌ Selfbot {name} error: {repr(e)}")
                 ok = False
+            if isinstance(ok, str):
+                bundle_add(bundle, "selfbot", f"Selfbot {name}", channel_id, ok)
             if report: report.add("🤖 Selfbot", name, bool(ok))
 
     # 2. Webhook Rebel Angels — после selfbot-каналов
-    if DISCORD_WEBHOOK_URL_2:
+    if DISCORD_WEBHOOK_URL_2 and not cancelled():
         pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
         log(f"⏸ Пауза {pause:.1f} сек перед Rebel Angels...")
         await asyncio.sleep(pause)
         try:
+            ids = []
             if img_bytes:
-                _send_webhook_photo(DISCORD_WEBHOOK_URL_2, text, img_bytes)
+                ids = _send_webhook_photo(DISCORD_WEBHOOK_URL_2, text, img_bytes)
                 log("✅ Webhook Rebel Angels фото")
             elif text:
-                _send_webhook_text(DISCORD_WEBHOOK_URL_2, text)
+                ids = _send_webhook_text(DISCORD_WEBHOOK_URL_2, text)
                 log("✅ Webhook Rebel Angels текст")
+            for mid in ids:
+                bundle_add(bundle, "webhook", "Webhook Rebel Angels", DISCORD_WEBHOOK_URL_2, mid)
             if report: report.add("🌐 Discord webhook", "Rebel Angels", True)
         except Exception as e:
             log(f"❌ Webhook Rebel Angels error: {repr(e)}")
             if report: report.add("🌐 Discord webhook", "Rebel Angels", False, str(e)[:60])
 
     # 3. Сводка о доставке — в самом конце, когда всё отправлено
-    await finish()
+    if not cancelled():
+        await finish()
 
 
 # ── Команды ───────────────────────────────────────────────────────────────────
@@ -469,7 +536,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/bridge — тумблер автопересылки\n"
         "/status — статус Discord\n"
         "/checkchats — диагностика TG таргетов\n"
-        "/mychats — ID всех групп аккаунтов",
+        "/mychats — ID всех групп аккаунтов\n"
+        "/posts — последние посты (удалить везде)",
         parse_mode="HTML",
     )
 
@@ -721,6 +789,149 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await update.message.reply_text(f"❌ Discord ошибка: {r.status}")
+
+
+# ── /posts: последние пересланные посты, удаление разом везде ─────────────────
+
+def _find_bundle(uid: int) -> Optional[dict]:
+    for b in sent_posts:
+        if b["uid"] == uid:
+            return b
+    return None
+
+
+async def _delete_everywhere(bundle: dict, bot: Bot) -> list[tuple]:
+    """
+    Удаляем все сообщения связки по всем таргетам. Флаг deleted ставим
+    ПЕРВЫМ делом — он же отменяет ещё не отправленные отложенные волны
+    (delayed_send / late_photo_wave проверяют его перед каждой отправкой).
+    """
+    bundle["deleted"] = True
+    results = []
+    for it in bundle["items"]:
+        kind, label, refs = it["kind"], it["label"], it["refs"]
+        ok, note = False, ""
+        try:
+            if kind == "bot1":
+                await bot.delete_message(chat_id=refs[0], message_id=refs[1])
+                ok = True
+            elif kind == "bot2":
+                await Bot(token=BOT_TOKEN_2).delete_message(chat_id=refs[0], message_id=refs[1])
+                ok = True
+            elif kind == "user":
+                acc = next((a for a in user_accounts if a["name"] == refs[0]), None)
+                if acc is None:
+                    note = "аккаунт не подключён"
+                else:
+                    await acc["client"].delete_messages(refs[1], [refs[2]])
+                    ok = True
+            elif kind == "webhook":
+                r = await asyncio.to_thread(
+                    requests.delete, f"{refs[0]}/messages/{refs[1]}", timeout=30)
+                ok = r.status_code in (200, 204)
+                if not ok:
+                    note = f"HTTP {r.status_code}"
+            elif kind == "selfbot":
+                async with aiohttp.ClientSession() as s:
+                    async with s.delete(
+                        f"{DISCORD_API}/channels/{refs[0]}/messages/{refs[1]}",
+                        headers=discord_headers(),
+                    ) as r:
+                        ok = r.status in (200, 204)
+                        if not ok:
+                            note = f"HTTP {r.status}"
+        except Exception as e:
+            note = str(e)[:60]
+        log(f"{'🗑' if ok else '❌'} Удаление {label}: {'ok' if ok else note}")
+        results.append((label, ok, note))
+        await asyncio.sleep(0.4)   # мягкий темп, чтобы не ловить лимиты API
+    return results
+
+
+async def cmd_posts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not sent_posts:
+        await update.message.reply_text("📭 Память постов пуста (после рестарта она обнуляется).")
+        return
+    keyboard = []
+    for b in reversed(sent_posts):
+        mark = "☑️" if b["deleted"] else "🗑"
+        keyboard.append([InlineKeyboardButton(
+            f"{mark} {b['time']} · {b['preview'][:32]}",
+            callback_data=f"pdel:{b['uid']}",
+        )])
+    await update.message.reply_text(
+        f"🧹 <b>Последние посты</b> ({len(sent_posts)}/{POSTS_KEEP})\n"
+        "Нажми на пост, чтобы удалить его во всех таргетах:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
+
+
+async def cb_post_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("Нет доступа.")
+        return
+    uid = int(query.data.split(":", 1)[1])
+    b = _find_bundle(uid)
+    if b is None:
+        await query.answer("Поста уже нет в памяти.")
+        return
+    if b["deleted"]:
+        await query.answer("Уже удалён.")
+        return
+    await query.answer()
+    await query.edit_message_text(
+        f"❗️ Удалить этот пост из {len(b['items'])} мест?\n\n"
+        f"<i>{html.escape(b['preview'])}</i> · {b['time']}",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, удалить везде", callback_data=f"pdelc:{uid}"),
+            InlineKeyboardButton("↩️ Отмена",           callback_data=f"pdelx:{uid}"),
+        ]]),
+        parse_mode="HTML",
+    )
+
+
+async def cb_post_del_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("Нет доступа.")
+        return
+    uid = int(query.data.split(":", 1)[1])
+    b = _find_bundle(uid)
+    if b is None:
+        await query.answer("Поста уже нет в памяти.")
+        return
+    if b["deleted"]:
+        await query.answer("Уже удалён.")
+        return
+    await query.answer("🗑 Удаляю...")
+    results = await _delete_everywhere(b, ctx.bot)
+    good = sum(1 for _, ok, _ in results if ok)
+    lines = [
+        f"🗑 <b>Удаление поста</b> — {good}/{len(results)}",
+        f"<i>{html.escape(b['preview'])}</i> · {b['time']}",
+        "",
+    ]
+    for label, ok, note in results:
+        row = f"{'✅' if ok else '❌'} {html.escape(label)}"
+        if note and not ok:
+            row += f" — <i>{html.escape(note)}</i>"
+        lines.append(row)
+    if not results:
+        lines.append("(отправленных сообщений не было — отменены только отложенные волны)")
+    await query.edit_message_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cb_post_del_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("Нет доступа.")
+        return
+    await query.answer("Отменено")
+    await query.edit_message_text("↩️ Отменено. /posts — показать список снова.")
 
 
 # ── Фильтр ────────────────────────────────────────────────────────────────────
@@ -1017,37 +1228,32 @@ def split_text(text: str, limit: int = 1900) -> list[str]:
     return parts
 
 
-def send_discord_webhook_text(text: str):
-    if not DISCORD_WEBHOOK_URL:
-        return
-    for part in split_text(text):
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": part}, timeout=30).raise_for_status()
-    log("✅ Webhook Bee текст")
+def send_discord_webhook_text(text: str) -> list:
+    ids = _send_webhook_text(DISCORD_WEBHOOK_URL, text)
+    if DISCORD_WEBHOOK_URL:
+        log("✅ Webhook Bee текст")
+    return ids
 
 
-def send_discord_webhook_photo(caption: str, image_bytes: bytes):
-    if not DISCORD_WEBHOOK_URL:
-        return
-    requests.post(
-        DISCORD_WEBHOOK_URL,
-        data={"payload_json": json.dumps({"content": caption or ""}, ensure_ascii=False)},
-        files={"files[0]": ("photo.png", image_bytes, "image/png")},
-        timeout=60,
-    ).raise_for_status()
-    log("✅ Webhook Bee фото")
+def send_discord_webhook_photo(caption: str, image_bytes: bytes) -> list:
+    ids = _send_webhook_photo(DISCORD_WEBHOOK_URL, caption, image_bytes)
+    if DISCORD_WEBHOOK_URL:
+        log("✅ Webhook Bee фото")
+    return ids
 
 
 # ── Telegram senders (боты) — каждый канал в своём try/except + свой токен ───
 
 async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, ru_text: str, en_text: str,
-                       report: Optional[Report] = None):
+                       report: Optional[Report] = None, bundle: Optional[dict] = None):
     # TG #1 (Crypto Phoenix) — ЕДИНСТВЕННЫЙ таргет на русском
     if TARGET_CHAT_ID and ru_text:
         try:
             kwargs = dict(chat_id=TARGET_CHAT_ID, text=ru_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             if TARGET_MESSAGE_THREAD_ID:
                 kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
-            await context.bot.send_message(**kwargs)
+            m = await context.bot.send_message(**kwargs)
+            bundle_add(bundle, "bot1", "TG #1", TARGET_CHAT_ID, m.message_id)
             log("✅ Sent text to TG #1 (RU)")
             if report: report.add("📱 Telegram", "TG #1", True)
         except Exception as e:
@@ -1061,7 +1267,8 @@ async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, ru_text: str, en_text
             kwargs = dict(chat_id=TARGET_CHAT_ID_2, text=en_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             if TARGET_MESSAGE_THREAD_ID_2:
                 kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
-            await bot2.send_message(**kwargs)
+            m = await bot2.send_message(**kwargs)
+            bundle_add(bundle, "bot2", "Heaven", TARGET_CHAT_ID_2, m.message_id)
             log("✅ Sent text to TG #2 (Heaven, EN)")
             if report: report.add("📱 Telegram", "Heaven", True)
         except Exception as e:
@@ -1071,7 +1278,8 @@ async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, ru_text: str, en_text
 
 async def send_tg_photo_main(context: ContextTypes.DEFAULT_TYPE, file_id: str,
                              ru_caption: Optional[str],
-                             report: Optional[Report] = None):
+                             report: Optional[Report] = None,
+                             bundle: Optional[dict] = None):
     # TG #1 (Crypto Phoenix) — русская подпись, тот же бот → file_id валиден,
     # скачивание байтов не нужно: шлём сразу, не дожидаясь download_photo
     if not TARGET_CHAT_ID:
@@ -1082,7 +1290,8 @@ async def send_tg_photo_main(context: ContextTypes.DEFAULT_TYPE, file_id: str,
             kwargs["caption"] = ru_caption
         if TARGET_MESSAGE_THREAD_ID:
             kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID
-        await context.bot.send_photo(**kwargs)
+        m = await context.bot.send_photo(**kwargs)
+        bundle_add(bundle, "bot1", "TG #1", TARGET_CHAT_ID, m.message_id)
         log("✅ Sent photo to TG #1 (RU)")
         if report: report.add("📱 Telegram", "TG #1", True)
     except Exception as e:
@@ -1091,7 +1300,8 @@ async def send_tg_photo_main(context: ContextTypes.DEFAULT_TYPE, file_id: str,
 
 
 async def send_tg_photo_heaven(en_caption: Optional[str], img_bytes: Optional[bytes],
-                               report: Optional[Report] = None):
+                               report: Optional[Report] = None,
+                               bundle: Optional[dict] = None):
     # TG #2 (Heaven) — английская подпись. ДРУГОЙ бот: file_id от бота #1
     # у него невалиден ('Wrong file identifier'), поэтому шлём фото байтами
     if not (TARGET_CHAT_ID_2 and BOT_TOKEN_2):
@@ -1107,7 +1317,8 @@ async def send_tg_photo_heaven(en_caption: Optional[str], img_bytes: Optional[by
             kwargs["caption"] = en_caption
         if TARGET_MESSAGE_THREAD_ID_2:
             kwargs["message_thread_id"] = TARGET_MESSAGE_THREAD_ID_2
-        await bot2.send_photo(**kwargs)
+        m = await bot2.send_photo(**kwargs)
+        bundle_add(bundle, "bot2", "Heaven", TARGET_CHAT_ID_2, m.message_id)
         log("✅ Sent photo to TG #2 (Heaven, EN)")
         if report: report.add("📱 Telegram", "Heaven", True)
     except Exception as e:
@@ -1237,7 +1448,8 @@ async def user_shutdown(app):
             log(f"❌ Userbot {acc['name']} shutdown error: {repr(e)}")
 
 
-async def send_user_text(text: str, report: Optional[Report] = None):
+async def send_user_text(text: str, report: Optional[Report] = None,
+                         bundle: Optional[dict] = None):
     if not text:
         return
     for acc in user_accounts:
@@ -1246,7 +1458,8 @@ async def send_user_text(text: str, report: Optional[Report] = None):
                 kwargs = {}
                 if topic:
                     kwargs["reply_to"] = topic
-                await acc["client"].send_message(entity, text, link_preview=False, **kwargs)
+                m = await acc["client"].send_message(entity, text, link_preview=False, **kwargs)
+                bundle_add(bundle, "user", label, acc["name"], entity, m.id)
                 log(f"✅ Sent text to {label}")
                 if report: report.add("📱 Telegram", label, True)
             except Exception as e:
@@ -1255,7 +1468,8 @@ async def send_user_text(text: str, report: Optional[Report] = None):
 
 
 async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str],
-                          report: Optional[Report] = None):
+                          report: Optional[Report] = None,
+                          bundle: Optional[dict] = None):
     if not any(acc["targets"] for acc in user_accounts):
         return
     # аккаунт — тоже «чужой» клиент, file_id бота ему не подходит → только байты
@@ -1274,7 +1488,8 @@ async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str],
                 kwargs = {}
                 if topic:
                     kwargs["reply_to"] = topic
-                await acc["client"].send_file(entity, bio, caption=caption or "", **kwargs)
+                m = await acc["client"].send_file(entity, bio, caption=caption or "", **kwargs)
+                bundle_add(bundle, "user", label, acc["name"], entity, m.id)
                 log(f"✅ Sent photo to {label}")
                 if report: report.add("📱 Telegram", label, True)
             except Exception as e:
@@ -1283,7 +1498,8 @@ async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str],
 
 
 async def late_photo_wave(bot: Bot, file_id: str, dc_text: str,
-                          report: Optional[Report] = None):
+                          report: Optional[Report] = None,
+                          bundle: Optional[dict] = None):
     """
     Вторая волна: фото не скачалось с первого захода (Telegram лагал).
     Ждём, пробуем снова с длинной серией ретраев и догоняем все таргеты,
@@ -1293,20 +1509,29 @@ async def late_photo_wave(bot: Bot, file_id: str, dc_text: str,
     """
     log(f"🔁 Вторая волна фото через {LATE_PHOTO_WAIT} сек...")
     await asyncio.sleep(LATE_PHOTO_WAIT)
+
+    if bundle and bundle["deleted"]:
+        log("🛑 Пост удалён через /posts — вторая волна отменена")
+        return
+
     img_bytes = await download_photo(bot, file_id, attempts=5)
 
     # None оба сендера обрабатывают сами: лог + ❌ в сводке
-    await send_tg_photo_heaven(dc_text, img_bytes, report)
-    await send_user_photo(img_bytes, dc_text, report)
+    await send_tg_photo_heaven(dc_text, img_bytes, report, bundle)
+    await send_user_photo(img_bytes, dc_text, report, bundle)
 
     if DISCORD_WEBHOOK_URL:
         try:
             if img_bytes:
-                send_discord_webhook_photo(dc_text, img_bytes)
+                ids = send_discord_webhook_photo(dc_text, img_bytes)
                 if report: report.add("🌐 Discord webhook", "Bee", True)
             elif dc_text:
-                send_discord_webhook_text(dc_text)
+                ids = send_discord_webhook_text(dc_text)
                 if report: report.add("🌐 Discord webhook", "Bee", True)
+            else:
+                ids = []
+            for mid in ids:
+                bundle_add(bundle, "webhook", "Webhook Bee", DISCORD_WEBHOOK_URL, mid)
         except Exception as e:
             log(f"❌ Webhook Bee error: {repr(e)}")
             if report: report.add("🌐 Discord webhook", "Bee", False, str(e)[:60])
@@ -1319,7 +1544,7 @@ async def late_photo_wave(bot: Bot, file_id: str, dc_text: str,
 
     # file_id передаём дальше: delayed_send сможет попробовать докачать
     # ещё раз после своей задержки 2-3 мин
-    await delayed_send(dc_text, img_bytes, report, bot, file_id)
+    await delayed_send(dc_text, img_bytes, report, bot, file_id, bundle)
 
 
 # ── Handler ───────────────────────────────────────────────────────────────────
@@ -1348,6 +1573,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     # В превью — английский оригинал (dc_text), русский только запасной вариант.
     preview = (dc_text or tg_text or "фото").splitlines()[0][:60] if (dc_text or tg_text) else "фото"
     report  = Report(preview)
+    bundle  = new_bundle(preview)   # связка ID всех отправок — для /posts
 
     # 1-2. Фото: TG #1 сразу по file_id (ему скачивание не нужно), потом
     # качаем байты для остальных. Не скачалось — вторую волну в фон и выходим:
@@ -1355,32 +1581,35 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     img_bytes = None
     if msg.photo:
         file_id = msg.photo[-1].file_id
-        await send_tg_photo_main(context, file_id, tg_text, report)
+        await send_tg_photo_main(context, file_id, tg_text, report, bundle)
         img_bytes = await download_photo(context.bot, file_id)
         if img_bytes is None:
-            asyncio.create_task(late_photo_wave(context.bot, file_id, dc_text, report))
+            asyncio.create_task(late_photo_wave(context.bot, file_id, dc_text, report, bundle))
             return
-        await send_tg_photo_heaven(dc_text, img_bytes, report)
+        await send_tg_photo_heaven(dc_text, img_bytes, report, bundle)
     elif tg_text or dc_text:
-        await send_tg_text(context, tg_text, dc_text, report)
+        await send_tg_text(context, tg_text, dc_text, report, bundle)
     else:
         log("⏭ Skip Telegram: empty")
 
     # 2b. Telegram — от лица моих аккаунтов. Английский оригинал
     if msg.photo:
-        await send_user_photo(img_bytes, dc_text, report)
+        await send_user_photo(img_bytes, dc_text, report, bundle)
     elif dc_text:
-        await send_user_text(dc_text, report)
+        await send_user_text(dc_text, report, bundle)
 
     # 3. Discord webhook Bee (мгновенно)
     if DISCORD_WEBHOOK_URL:
         try:
+            ids = []
             if img_bytes:
-                send_discord_webhook_photo(dc_text, img_bytes)
+                ids = send_discord_webhook_photo(dc_text, img_bytes)
                 report.add("🌐 Discord webhook", "Bee", True)
             elif dc_text:
-                send_discord_webhook_text(dc_text)
+                ids = send_discord_webhook_text(dc_text)
                 report.add("🌐 Discord webhook", "Bee", True)
+            for mid in ids:
+                bundle_add(bundle, "webhook", "Webhook Bee", DISCORD_WEBHOOK_URL, mid)
         except Exception as e:
             log(f"❌ Webhook Bee error: {repr(e)}")
             report.add("🌐 Discord webhook", "Bee", False, str(e)[:60])
@@ -1394,7 +1623,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         await send_report(context.bot, report)
         return
 
-    asyncio.create_task(delayed_send(dc_text, img_bytes, report, context.bot, photo_file_id))
+    asyncio.create_task(delayed_send(dc_text, img_bytes, report, context.bot, photo_file_id, bundle))
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
@@ -1417,6 +1646,10 @@ def main():
     app.add_handler(CommandHandler("status",        cmd_status))
     app.add_handler(CommandHandler("checkchats",    cmd_checkchats))
     app.add_handler(CommandHandler("mychats",       cmd_mychats))
+    app.add_handler(CommandHandler("posts",         cmd_posts))
+    app.add_handler(CallbackQueryHandler(cb_post_del_confirm, pattern=r"^pdelc:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_post_del_cancel,  pattern=r"^pdelx:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_post_del,         pattern=r"^pdel:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_ch_toggle,     pattern=r"^chtoggle:"))
     app.add_handler(CallbackQueryHandler(cb_bridge_toggle, pattern=r"^bridge_toggle$"))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
