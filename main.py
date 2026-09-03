@@ -1448,11 +1448,42 @@ async def user_shutdown(app):
             log(f"❌ Userbot {acc['name']} shutdown error: {repr(e)}")
 
 
+async def _ensure_connected(acc) -> bool:
+    """
+    Telethon мог отвалиться (сеть моргнула, сессию убили) — тогда любая
+    отправка падает с «Cannot send requests while disconnected». Перед
+    отправкой проверяем связь и один раз пробуем переподключиться; если
+    сессия недействительна — говорим об этом прямо, а не сыплем ошибками.
+    """
+    client = acc["client"]
+    try:
+        if not client.is_connected():
+            log(f"🔌 Userbot {acc['name']}: соединение потеряно, переподключаюсь...")
+            await client.connect()
+        if not await client.is_user_authorized():
+            log(f"❌ Userbot {acc['name']}: сессия недействительна — нужна новая "
+                f"строка TG_USER_SESSION{'' if acc['name'] == USER_LABEL else '_2'}")
+            return False
+        return True
+    except Exception as e:
+        log(f"❌ Userbot {acc['name']}: переподключиться не удалось: {repr(e)}")
+        return False
+
+
+def _report_account_down(acc, report: Optional[Report], why: str):
+    if report:
+        for _, _, label in acc["targets"]:
+            report.add("📱 Telegram", label, False, why)
+
+
 async def send_user_text(text: str, report: Optional[Report] = None,
                          bundle: Optional[dict] = None):
     if not text:
         return
     for acc in user_accounts:
+        if not await _ensure_connected(acc):
+            _report_account_down(acc, report, "аккаунт отключён — см. лог")
+            continue
         for entity, topic, label in acc["targets"]:
             try:
                 kwargs = {}
@@ -1481,6 +1512,9 @@ async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str],
                     report.add("📱 Telegram", label, False, "фото не скачалось")
         return
     for acc in user_accounts:
+        if not await _ensure_connected(acc):
+            _report_account_down(acc, report, "аккаунт отключён — см. лог")
+            continue
         for entity, topic, label in acc["targets"]:
             try:
                 bio = io.BytesIO(img_bytes)
