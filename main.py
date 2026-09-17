@@ -1581,6 +1581,109 @@ async def late_photo_wave(bot: Bot, file_id: str, dc_text: str,
     await delayed_send(dc_text, img_bytes, report, bot, file_id, bundle)
 
 
+# ── Callout → CryptoTraders ───────────────────────────────────────────────────
+# Независимая фоновая ветка: сигнал из источника (текст и/или карточка-картинка)
+# распознаётся моделью и уходит selfbot'ом в формате callout-бота сервера
+# CryptoTraders. Полностью выключена, пока не заданы CALLOUT_CHANNEL_ID и
+# ANTHROPIC_API_KEY; на основную пересылку не влияет ни при каких ошибках.
+
+CALLOUT_CHANNEL_ID = os.getenv("CALLOUT_CHANNEL_ID", "").strip()
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "").strip()
+CALLOUT_MODEL      = os.getenv("CALLOUT_MODEL", "claude-haiku-4-5-20251001")
+
+CALLOUT_PROMPT = """You convert crypto trading signals into commands for a Discord callout bot.
+
+Input: a message from a trading channel — text and/or a screenshot of a position card.
+Output: ONLY the command lines, nothing else. If the message is not an actionable
+trading signal (balance updates, results recaps, chatter, ads), output exactly: SKIP
+
+Command formats (pick one):
+1) New trade:
+Long BTC @ M 10X
+TP: 105000, 106000
+SL: 103000
+   - side Long/Short, plain ticker; entry "@ M" if market/now, or "@ <price>"
+   - leverage "NX" only if stated; omit TP/SL lines that are not given
+2) Change stop or targets of an open trade: UPDATE BTC SL 25000  |  UPDATE BTC TP 30000, 35000
+3) Average/DCA into an open trade: AVG BTC @ 30000   (or "AVG BTC" for market)
+4) Partial close: PARTIAL CLOSE BTC @ M   (or "@ <price>")
+5) Full close: CLOSE BTC @ M
+
+Rules:
+- Plain tickers only (BTC, ETH, VVV) — no $ signs, no /USDT, no exchange names.
+- "k" means thousands: 76.7k -> 76700. Keep decimals exactly as given.
+- "1st/2nd/3rd DCA <price>" or "EP" mentions = averaging (format 3) at that price.
+- "Stops <price>" / "SL to <price>" for an open trade = UPDATE ... SL <price>.
+- If text and image disagree, trust the more complete source; combine when they add up.
+- Never invent numbers or coins that are not in the message. When unsure: SKIP
+"""
+
+
+def callout_enabled() -> bool:
+    return bool(DISCORD_TOKEN and CALLOUT_CHANNEL_ID and ANTHROPIC_API_KEY)
+
+
+def _callout_ask_model(text: str, img_bytes: Optional[bytes]) -> Optional[str]:
+    """Синхронный вызов Anthropic API (гоняется через to_thread)."""
+    import base64 as _b64
+    content = []
+    if img_bytes:
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg",
+                       "data": _b64.b64encode(img_bytes).decode()},
+        })
+    content.append({"type": "text", "text": text or "(no text — read the card image)"})
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": ANTHROPIC_API_KEY,
+                 "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"},
+        json={"model": CALLOUT_MODEL, "max_tokens": 300,
+              "system": CALLOUT_PROMPT,
+              "messages": [{"role": "user", "content": content}]},
+        timeout=60,
+    )
+    r.raise_for_status()
+    out = "".join(b.get("text", "") for b in r.json().get("content", [])
+                  if b.get("type") == "text").strip()
+    return out or None
+
+
+async def callout_pipeline(bot: Bot, text: str, photo_file_id: Optional[str],
+                           report: Optional[Report] = None,
+                           bundle: Optional[dict] = None):
+    try:
+        img_bytes = None
+        if photo_file_id:
+            # качаем сами (с ретраями): ветка не должна зависеть от того,
+            # успела ли скачать фото основная пересылка
+            img_bytes = await download_photo(bot, photo_file_id)
+        if not text and not img_bytes:
+            return
+
+        cmd = await asyncio.to_thread(_callout_ask_model, text, img_bytes)
+        if not cmd or cmd.strip().upper().startswith("SKIP"):
+            log("⏭ Callout: не сигнал — пропуск")
+            return
+        # страховка от разговорчивого ответа модели: команды всегда короткие
+        if len(cmd) > 400 or cmd.count("\n") > 7:
+            log(f"⏭ Callout: подозрительный ответ модели — пропуск: {cmd[:120]!r}")
+            return
+
+        if bundle and bundle["deleted"]:
+            log("🛑 Пост удалён через /posts — callout отменён")
+            return
+        ok = await discord_send_text(cmd, CALLOUT_CHANNEL_ID)
+        if isinstance(ok, str):
+            bundle_add(bundle, "selfbot", "Callout CryptoTraders", CALLOUT_CHANNEL_ID, ok)
+        if report:
+            report.add("🤖 Selfbot", "Callout CryptoTraders", bool(ok))
+        log(f"{'✅' if ok else '❌'} Callout → CryptoTraders:\n{cmd}")
+    except Exception as e:
+        log(f"❌ Callout error: {repr(e)}")
+
+
 # ── Handler ───────────────────────────────────────────────────────────────────
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1608,6 +1711,13 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     preview = (dc_text or tg_text or "фото").splitlines()[0][:60] if (dc_text or tg_text) else "фото"
     report  = Report(preview)
     bundle  = new_bundle(preview)   # связка ID всех отправок — для /posts
+
+    # 0. Callout для CryptoTraders — независимая фоновая ветка (стоп-фразы уже
+    # отработали выше, так что реклама сюда не доходит)
+    if callout_enabled():
+        asyncio.create_task(callout_pipeline(
+            context.bot, dc_text or raw_text,
+            msg.photo[-1].file_id if msg.photo else None, report, bundle))
 
     # 1-2. Фото: TG #1 сразу по file_id (ему скачивание не нужно), потом
     # качаем байты для остальных. Не скачалось — вторую волну в фон и выходим:
