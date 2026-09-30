@@ -120,6 +120,20 @@ LATE_PHOTO_WAIT       = int(os.getenv("LATE_PHOTO_WAIT", "60") or "60")
 # Хранится только в памяти процесса: несколько КБ, диск не используется.
 POSTS_KEEP            = int(os.getenv("POSTS_KEEP", "15") or "15")
 
+# Отправки от лица аккаунтов (Telethon) ограничены по времени: 30.09 умершая сессия
+# BumbleBee повесила отправку навсегда — и вместе с ней всю пересылку. Теперь зависший
+# или умерший аккаунт даёт ❌ в сводке, а остальные таргеты получают пост как обычно.
+USER_SEND_TIMEOUT     = int(os.getenv("USER_SEND_TIMEOUT", "30") or "30")
+USER_PHOTO_TIMEOUT    = int(os.getenv("USER_PHOTO_TIMEOUT", "90") or "90")
+# Railway при деплое поднимает новый контейнер, пока старый ещё работает. Если оба
+# подключатся одной сессией с разных IP, Telegram навсегда её отзывает — поэтому аккаунты
+# подключаются с паузой, когда старый контейнер уже отключился.
+USER_START_DELAY      = int(os.getenv("USER_START_DELAY", "30") or "30")
+# после этих ошибок сессия мертва навсегда — нужна новая строка
+DEAD_SESSION_ERRORS   = {"AuthKeyUnregisteredError", "AuthKeyDuplicatedError", "SessionRevokedError",
+                         "SessionExpiredError", "UserDeactivatedError", "UserDeactivatedBanError",
+                         "AuthKeyInvalidError", "AuthKeyPermEmptyError"}
+
 
 def _parse_channels_env() -> dict:
     result = {}
@@ -317,7 +331,7 @@ async def _discord_send(build_request, channel_id: str, kind: str) -> bool:
             # тело запроса собираем заново на каждую попытку:
             # aiohttp.FormData одноразовая, повторно её отправить нельзя
             kwargs = build_request()
-            async with aiohttp.ClientSession() as s:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as s:
                 async with s.post(url, **kwargs) as r:
                     if r.status == 200:
                         suffix = f" (с {attempt}-й попытки)" if attempt > 1 else ""
@@ -428,13 +442,15 @@ async def download_photo(bot: Bot, file_id: str, attempts: int = 0) -> Optional[
 async def delayed_send(text: str, img_bytes: Optional[bytes],
                        report: Optional[Report] = None, bot: Optional[Bot] = None,
                        photo_file_id: Optional[str] = None,
-                       bundle: Optional[dict] = None):
+                       bundle: Optional[dict] = None,
+                       user_task: Optional[asyncio.Task] = None):
     """Задержка 48-72 сек → selfbot каналы (паузы 7-10 сек) → пауза → Rebel Angels → сводка."""
 
     def cancelled() -> bool:
         return bool(bundle and bundle["deleted"])
 
     async def finish():
+        await _await_users(user_task)          # отправки аккаунтов шли в фоне — ждём их итог
         if report and bot:
             await send_report(bot, report)
 
@@ -502,10 +518,10 @@ async def delayed_send(text: str, img_bytes: Optional[bytes],
         try:
             ids = []
             if img_bytes:
-                ids = _send_webhook_photo(DISCORD_WEBHOOK_URL_2, text, img_bytes)
+                ids = await asyncio.to_thread(_send_webhook_photo, DISCORD_WEBHOOK_URL_2, text, img_bytes)
                 log("✅ Webhook Rebel Angels фото")
             elif text:
-                ids = _send_webhook_text(DISCORD_WEBHOOK_URL_2, text)
+                ids = await asyncio.to_thread(_send_webhook_text, DISCORD_WEBHOOK_URL_2, text)
                 log("✅ Webhook Rebel Angels текст")
             for mid in ids:
                 bundle_add(bundle, "webhook", "Webhook Rebel Angels", DISCORD_WEBHOOK_URL_2, mid)
@@ -576,8 +592,12 @@ async def cmd_checkchats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Аккаунт-таргеты (Telethon) — все подключённые аккаунты
     if user_accounts:
         for acc in user_accounts:
+            if acc.get("dead"):
+                results.append(f"💀 Аккаунт {html.escape(acc['name'])}: сессия умерла — нужна новая "
+                               f"<code>{_session_var(acc['name'])}</code>")
+                continue
             try:
-                me = await acc["client"].get_me()
+                me = await asyncio.wait_for(acc["client"].get_me(), USER_SEND_TIMEOUT)
                 handle = html.escape(me.username or me.first_name or "?")
                 results.append(f"✅ Аккаунт {html.escape(acc['name'])} (@{handle}) — чатов: {len(acc['targets'])}")
                 for _, topic, label in acc["targets"]:
@@ -631,6 +651,9 @@ async def cmd_mychats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             header += f" — поиск «{html.escape(needle)}»"
         lines, shown = [header, ""], 0
 
+        if acc.get("dead"):
+            await update.message.reply_text(f"💀 {acc['name']}: сессия умерла — нужна новая {_session_var(acc['name'])}")
+            continue
         try:
             async for d in acc["client"].iter_dialogs():
                 if d.is_user:
@@ -1405,7 +1428,38 @@ async def _resolve_ref(client, ref):
     return await client.get_entity(ref)
 
 
+users_ready = asyncio.Event()        # аккаунты подключены (или подключать нечего)
+APP_BOT: Optional[Bot] = None        # бот пульта — для тревог об аккаунтах
+
+
+def _session_var(name: str) -> str:
+    return "TG_USER_SESSION" if name == USER_LABEL else "TG_USER_SESSION_2"
+
+
+async def _alert(text: str):
+    if APP_BOT is not None:
+        await _deliver_report(APP_BOT, text)
+
+
 async def user_init(app):
+    """Аккаунты подключаем в фоне с паузой USER_START_DELAY — бот при этом уже работает."""
+    global APP_BOT
+    APP_BOT = app.bot
+    asyncio.create_task(_user_init_later())
+
+
+async def _user_init_later():
+    try:
+        if _configured_accounts() and TG_API_ID and TG_API_HASH and USER_START_DELAY > 0:
+            log(f"⏳ Userbot: подключу аккаунты через {USER_START_DELAY} сек "
+                "(старый контейнер Railway должен успеть отключиться)")
+            await asyncio.sleep(USER_START_DELAY)
+        await _user_init_now()
+    finally:
+        users_ready.set()
+
+
+async def _user_init_now():
     """Поднимаем все аккаунты на том же event loop, что и бот, резолвим чаты."""
     global user_accounts
     configs = _configured_accounts()
@@ -1416,17 +1470,20 @@ async def user_init(app):
         try:
             client = TelegramClient(StringSession(session), TG_API_ID, TG_API_HASH)
             client.parse_mode = None       # текст как есть, без markdown-разметки
-            await client.connect()         # НЕ start(): иначе полезет спрашивать код в консоли
-            if not await client.is_user_authorized():
-                log(f"❌ Userbot {name}: сессия невалидна — перегенерируй session-строку")
+            await asyncio.wait_for(client.connect(), USER_SEND_TIMEOUT)   # НЕ start(): спросит код в консоли
+            if not await asyncio.wait_for(client.is_user_authorized(), USER_SEND_TIMEOUT):
+                log(f"❌ Userbot {name}: сессия невалидна — нужна новая строка {_session_var(name)}")
+                await _alert(f"❌ <b>Аккаунт {html.escape(name)}</b>: сессия недействительна — его таргеты "
+                             f"не получают посты. Нужна новая строка <code>{_session_var(name)}</code> "
+                             "(python make_session.py" + ("" if name == USER_LABEL else " ivan") + ").")
                 await client.disconnect()
                 continue
-            me = await client.get_me()
+            me = await asyncio.wait_for(client.get_me(), USER_SEND_TIMEOUT)
 
             resolved = []
             for ref, topic in targets_cfg:
                 try:
-                    entity = await _resolve_ref(client, ref)
+                    entity = await asyncio.wait_for(_resolve_ref(client, ref), 60)
                     title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(ref)
                     resolved.append((entity, topic, f"{title} ({name})"))
                     log(f"✅ Таргет {name} подключён: {title}" + (f" (topic {topic})" if topic else ""))
@@ -1448,25 +1505,45 @@ async def user_shutdown(app):
             log(f"❌ Userbot {acc['name']} shutdown error: {repr(e)}")
 
 
+async def _mark_dead(acc, err: Exception):
+    """Сессия аккаунта умерла навсегда: больше не пытаемся, один раз сообщаем, что делать."""
+    if acc.get("dead"):
+        return
+    acc["dead"] = type(err).__name__
+    log(f"💀 Userbot {acc['name']}: сессия умерла ({type(err).__name__}) — его таргеты пропускаются, "
+        f"нужна новая строка {_session_var(acc['name'])}")
+    await _alert(f"💀 <b>Аккаунт {html.escape(acc['name'])}</b>: Telegram отозвал сессию "
+                 f"(<code>{html.escape(type(err).__name__)}</code>). Его таргеты "
+                 f"({', '.join(html.escape(l) for _, _, l in acc['targets'])}) пропускаются, "
+                 "остальные получают посты как обычно.\n\nЧто сделать: <code>python make_session.py"
+                 + ("" if acc["name"] == USER_LABEL else " ivan") + f"</code> → новая строка в "
+                 f"<code>{_session_var(acc['name'])}</code> (Railway → Variables).")
+
+
 async def _ensure_connected(acc) -> bool:
     """
     Telethon мог отвалиться (сеть моргнула, сессию убили) — тогда любая
     отправка падает с «Cannot send requests while disconnected». Перед
-    отправкой проверяем связь и один раз пробуем переподключиться; если
-    сессия недействительна — говорим об этом прямо, а не сыплем ошибками.
+    отправкой проверяем связь и один раз пробуем переподключиться; после
+    переподключения проверяем сессию настоящим запросом (is_user_authorized
+    Telethon помнит старый ответ и мёртвую сессию не замечает).
     """
+    if acc.get("dead"):
+        return False
     client = acc["client"]
     try:
+        if acc.pop("stale", False) and client.is_connected():
+            await asyncio.wait_for(client.disconnect(), 15)   # прошлая отправка зависла
         if not client.is_connected():
             log(f"🔌 Userbot {acc['name']}: соединение потеряно, переподключаюсь...")
-            await client.connect()
-        if not await client.is_user_authorized():
-            log(f"❌ Userbot {acc['name']}: сессия недействительна — нужна новая "
-                f"строка TG_USER_SESSION{'' if acc['name'] == USER_LABEL else '_2'}")
-            return False
+            await asyncio.wait_for(client.connect(), USER_SEND_TIMEOUT)
+            await asyncio.wait_for(client.get_me(), USER_SEND_TIMEOUT)
         return True
     except Exception as e:
-        log(f"❌ Userbot {acc['name']}: переподключиться не удалось: {repr(e)}")
+        if type(e).__name__ in DEAD_SESSION_ERRORS:
+            await _mark_dead(acc, e)
+        else:
+            log(f"❌ Userbot {acc['name']}: переподключиться не удалось: {repr(e)}")
         return False
 
 
@@ -1476,31 +1553,78 @@ def _report_account_down(acc, report: Optional[Report], why: str):
             report.add("📱 Telegram", label, False, why)
 
 
+def _down_reason(acc) -> str:
+    if acc.get("dead"):
+        return f"сессия умерла — нужна новая {_session_var(acc['name'])}"
+    return "аккаунт не на связи — см. лог"
+
+
+async def _user_send(acc, targets: list, send_one, timeout: int, kind: str,
+                     report: Optional[Report], bundle: Optional[dict]):
+    """Отправка по таргетам аккаунта: у каждой — таймаут; мёртвая сессия или зависание —
+    остальные таргеты этого аккаунта пропускаем (они повисли бы так же), идём дальше."""
+    for i, (entity, topic, label) in enumerate(targets):
+        try:
+            m = await asyncio.wait_for(send_one(entity, topic), timeout)
+            bundle_add(bundle, "user", label, acc["name"], entity, m.id)
+            log(f"✅ Sent {kind} to {label}")
+            if report: report.add("📱 Telegram", label, True)
+        except asyncio.TimeoutError:
+            acc["stale"] = True
+            log(f"❌ {label}: аккаунт не ответил за {timeout} сек — пропускаю его таргеты")
+            if report:
+                report.add("📱 Telegram", label, False, f"аккаунт не ответил за {timeout} сек")
+                for _, _, rest in targets[i + 1:]:
+                    report.add("📱 Telegram", rest, False, "пропущен: аккаунт завис")
+            return
+        except Exception as e:
+            if type(e).__name__ in DEAD_SESSION_ERRORS:
+                await _mark_dead(acc, e)
+                if report:
+                    for _, _, rest in targets[i:]:
+                        report.add("📱 Telegram", rest, False, _down_reason(acc))
+                return
+            log(f"❌ {label} {kind} error: {repr(e)}")
+            if report: report.add("📱 Telegram", label, False, str(e)[:60])
+
+
+async def _wait_users_ready():
+    try:
+        await asyncio.wait_for(users_ready.wait(), USER_START_DELAY + 120)
+    except asyncio.TimeoutError:
+        pass
+
+
+async def _await_users(task: Optional[asyncio.Task]):
+    """Дождаться фоновых отправок аккаунтов (не дольше 5 минут), чтобы сводка была полной."""
+    if task is None:
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(task), 300)
+    except Exception as e:
+        log(f"⚠️ Отправки аккаунтов не завершились вовремя: {repr(e)}")
+
+
 async def send_user_text(text: str, report: Optional[Report] = None,
                          bundle: Optional[dict] = None):
     if not text:
         return
+    await _wait_users_ready()
     for acc in user_accounts:
         if not await _ensure_connected(acc):
-            _report_account_down(acc, report, "аккаунт отключён — см. лог")
+            _report_account_down(acc, report, _down_reason(acc))
             continue
-        for entity, topic, label in acc["targets"]:
-            try:
-                kwargs = {}
-                if topic:
-                    kwargs["reply_to"] = topic
-                m = await acc["client"].send_message(entity, text, link_preview=False, **kwargs)
-                bundle_add(bundle, "user", label, acc["name"], entity, m.id)
-                log(f"✅ Sent text to {label}")
-                if report: report.add("📱 Telegram", label, True)
-            except Exception as e:
-                log(f"❌ {label} error: {repr(e)}")
-                if report: report.add("📱 Telegram", label, False, str(e)[:60])
+
+        def send_one(entity, topic, client=acc["client"]):
+            return client.send_message(entity, text, link_preview=False,
+                                       **({"reply_to": topic} if topic else {}))
+        await _user_send(acc, acc["targets"], send_one, USER_SEND_TIMEOUT, "text", report, bundle)
 
 
 async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str],
                           report: Optional[Report] = None,
                           bundle: Optional[dict] = None):
+    await _wait_users_ready()
     if not any(acc["targets"] for acc in user_accounts):
         return
     # аккаунт — тоже «чужой» клиент, file_id бота ему не подходит → только байты
@@ -1513,22 +1637,15 @@ async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str],
         return
     for acc in user_accounts:
         if not await _ensure_connected(acc):
-            _report_account_down(acc, report, "аккаунт отключён — см. лог")
+            _report_account_down(acc, report, _down_reason(acc))
             continue
-        for entity, topic, label in acc["targets"]:
-            try:
-                bio = io.BytesIO(img_bytes)
-                bio.name = "photo.jpg"     # Telethon берёт расширение из имени
-                kwargs = {}
-                if topic:
-                    kwargs["reply_to"] = topic
-                m = await acc["client"].send_file(entity, bio, caption=caption or "", **kwargs)
-                bundle_add(bundle, "user", label, acc["name"], entity, m.id)
-                log(f"✅ Sent photo to {label}")
-                if report: report.add("📱 Telegram", label, True)
-            except Exception as e:
-                log(f"❌ {label} photo error: {repr(e)}")
-                if report: report.add("📱 Telegram", label, False, str(e)[:60])
+
+        def send_one(entity, topic, client=acc["client"]):
+            bio = io.BytesIO(img_bytes)
+            bio.name = "photo.jpg"     # Telethon берёт расширение из имени
+            return client.send_file(entity, bio, caption=caption or "",
+                                    **({"reply_to": topic} if topic else {}))
+        await _user_send(acc, acc["targets"], send_one, USER_PHOTO_TIMEOUT, "photo", report, bundle)
 
 
 async def late_photo_wave(bot: Bot, file_id: str, dc_text: str,
@@ -1552,15 +1669,15 @@ async def late_photo_wave(bot: Bot, file_id: str, dc_text: str,
 
     # None оба сендера обрабатывают сами: лог + ❌ в сводке
     await send_tg_photo_heaven(dc_text, img_bytes, report, bundle)
-    await send_user_photo(img_bytes, dc_text, report, bundle)
+    user_task = asyncio.create_task(send_user_photo(img_bytes, dc_text, report, bundle))
 
     if DISCORD_WEBHOOK_URL:
         try:
             if img_bytes:
-                ids = send_discord_webhook_photo(dc_text, img_bytes)
+                ids = await asyncio.to_thread(send_discord_webhook_photo, dc_text, img_bytes)
                 if report: report.add("🌐 Discord webhook", "Bee", True)
             elif dc_text:
-                ids = send_discord_webhook_text(dc_text)
+                ids = await asyncio.to_thread(send_discord_webhook_text, dc_text)
                 if report: report.add("🌐 Discord webhook", "Bee", True)
             else:
                 ids = []
@@ -1572,18 +1689,27 @@ async def late_photo_wave(bot: Bot, file_id: str, dc_text: str,
 
     if not dc_text and not img_bytes:
         log("⏭ Вторая волна: фото так и не скачалось, текста нет — стоп")
+        await _await_users(user_task)
         if report:
             await send_report(bot, report)
         return
 
     # file_id передаём дальше: delayed_send сможет попробовать докачать
     # ещё раз после своей задержки 2-3 мин
-    await delayed_send(dc_text, img_bytes, report, bot, file_id, bundle)
+    await delayed_send(dc_text, img_bytes, report, bot, file_id, bundle, user_task)
 
 
 # ── Handler ───────────────────────────────────────────────────────────────────
 
+post_lock = asyncio.Lock()   # посты — строго по одному и по порядку; команды при этом отвечают
+
+
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async with post_lock:
+        await _handle_channel_post(update, context)
+
+
+async def _handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.channel_post
     if not msg:
         return
@@ -1626,21 +1752,23 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         log("⏭ Skip Telegram: empty")
 
-    # 2b. Telegram — от лица моих аккаунтов. Английский оригинал
+    # 2b. Telegram — от лица моих аккаунтов. Английский оригинал. В фоне: зависший или
+    # умерший аккаунт не должен задерживать Discord и остальные таргеты
+    user_task = None
     if msg.photo:
-        await send_user_photo(img_bytes, dc_text, report, bundle)
+        user_task = asyncio.create_task(send_user_photo(img_bytes, dc_text, report, bundle))
     elif dc_text:
-        await send_user_text(dc_text, report, bundle)
+        user_task = asyncio.create_task(send_user_text(dc_text, report, bundle))
 
     # 3. Discord webhook Bee (мгновенно)
     if DISCORD_WEBHOOK_URL:
         try:
             ids = []
             if img_bytes:
-                ids = send_discord_webhook_photo(dc_text, img_bytes)
+                ids = await asyncio.to_thread(send_discord_webhook_photo, dc_text, img_bytes)
                 report.add("🌐 Discord webhook", "Bee", True)
             elif dc_text:
-                ids = send_discord_webhook_text(dc_text)
+                ids = await asyncio.to_thread(send_discord_webhook_text, dc_text)
                 report.add("🌐 Discord webhook", "Bee", True)
             for mid in ids:
                 bundle_add(bundle, "webhook", "Webhook Bee", DISCORD_WEBHOOK_URL, mid)
@@ -1654,10 +1782,12 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     photo_file_id = msg.photo[-1].file_id if msg.photo else None
     if not dc_text and not img_bytes and not photo_file_id:
         log("⏭ Skip delayed: empty")
+        await _await_users(user_task)
         await send_report(context.bot, report)
         return
 
-    asyncio.create_task(delayed_send(dc_text, img_bytes, report, context.bot, photo_file_id, bundle))
+    asyncio.create_task(delayed_send(dc_text, img_bytes, report, context.bot, photo_file_id, bundle,
+                                     user_task))
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
@@ -1669,6 +1799,7 @@ def main():
         .token(BOT_TOKEN)
         .post_init(user_init)
         .post_shutdown(user_shutdown)
+        .concurrent_updates(True)      # команды не ждут, пока пересылается пост
         .build()
     )
 
