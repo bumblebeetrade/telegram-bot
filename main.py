@@ -6,9 +6,12 @@ Telegram → Discord Bridge
   EN  — все остальные: TG #2 (Heaven), TG #3 (мой аккаунт),
         Discord webhook Bee, Rebel Angels, selfbot каналы
 
-Selfbot с задержкой 48-72 сек → каналы с паузами 7-10 сек →
+Selfbot с задержкой 48-72 сек от прихода поста → каналы с паузами 7-10 сек →
 webhook Rebel Angels → сводка в самом конце
 Плюс таргеты от лица моих аккаунтов (Telethon)
+
+Каждое направление — своя очередь: посты в нём идут по порядку, направления
+друг друга не ждут (зависший аккаунт или вебхук не задерживает остальных).
 
 Команды:
   /start
@@ -29,6 +32,7 @@ import html
 import json
 import asyncio
 import random
+import time
 import requests
 import aiohttp
 from collections import deque
@@ -439,100 +443,147 @@ async def download_photo(bot: Bot, file_id: str, attempts: int = 0) -> Optional[
     return None
 
 
-async def delayed_send(text: str, img_bytes: Optional[bytes],
-                       report: Optional[Report] = None, bot: Optional[Bot] = None,
-                       photo_file_id: Optional[str] = None,
-                       bundle: Optional[dict] = None,
-                       user_task: Optional[asyncio.Task] = None):
-    """Задержка 48-72 сек → selfbot каналы (паузы 7-10 сек) → пауза → Rebel Angels → сводка."""
+# ── Конвейер поста ────────────────────────────────────────────────────────────
+#
+# Каждое направление — TG #1, Heaven, webhook Bee, каждый аккаунт, каждый selfbot-канал,
+# Rebel Angels — своя очередь: в неё посты уходят строго по порядку (карточка не обгонит
+# текст), но направления друг друга не ждут: зависший аккаунт, упавший вебхук или медленный
+# Discord не задерживают остальных. Задержка selfbot-каналов и Rebel Angels считается
+# с момента, когда пост пришёл из канала-источника.
+
+_chains: dict = {}
+_last_deadline = 0.0          # задержки selfbot идут по порядку постов: следующий не раньше предыдущего
+REPORT_MAX_WAIT = 20 * 60     # сводка ждёт отправки не дольше (каждая и так ограничена таймаутами)
+
+
+def _chain(name: str, make) -> asyncio.Task:
+    """Запустить make() после предыдущей отправки в то же направление; остальных не ждать."""
+    prev = _chains.get(name)
+
+    async def run():
+        if prev is not None and not prev.done():
+            await asyncio.wait({prev})          # ошибка или зависание соседа нас не касаются
+        return await make()
+    task = asyncio.create_task(run())
+    _chains[name] = task
+    return task
+
+
+async def delayed_send(text: str, img_task: Optional[asyncio.Task], report: Report, bot: Optional[Bot],
+                       photo_file_id: Optional[str], bundle: Optional[dict], arrived: float) -> list:
+    """Задержка 48-72 сек от прихода поста → selfbot-каналы (паузы 7-10 сек) → пауза →
+    Rebel Angels. Ставит отправки в очереди каналов и возвращает их — сводка их дождётся."""
+    global _last_deadline
 
     def cancelled() -> bool:
         return bool(bundle and bundle["deleted"])
 
-    async def finish():
-        await _await_users(user_task)          # отправки аккаунтов шли в фоне — ждём их итог
-        if report and bot:
-            await send_report(bot, report)
-
     if not bridge_enabled:
-        if report:
-            report.add("🤖 Selfbot", "автопересылка выключена", False, "/bridge")
-        await finish()
-        return
+        report.add("🤖 Selfbot", "автопересылка выключена", False, "/bridge")
+        return []
 
     delay = random.uniform(BRIDGE_DELAY_MIN, BRIDGE_DELAY_MAX)
-    log(f"⏳ Задержка {delay:.0f} сек ({delay/60:.1f} мин)...")
-    await asyncio.sleep(delay)
+    deadline = max(arrived + delay, _last_deadline + 1)
+    _last_deadline = deadline
+    wait = deadline - time.time()
+    log(f"⏳ Selfbot и Rebel Angels — через {max(wait, 0):.0f} сек (задержка {delay:.0f} сек от прихода поста)")
+    if wait > 0:
+        await asyncio.sleep(wait)
 
     if not bridge_enabled:
-        if report:
-            report.add("🤖 Selfbot", "автопересылка выключена", False, "/bridge")
-        await finish()
-        return
+        report.add("🤖 Selfbot", "автопересылка выключена", False, "/bridge")
+        return []
 
-    # фото могло не скачаться сразу (Telegram таймаутил) — спустя
-    # 2-3 мин задержки пробуем ещё раз, обычно API уже отвечает
+    img_bytes = await img_task if img_task is not None else None
+    # фото могло не скачаться (Telegram таймаутил) — пробуем ещё раз, обычно API уже отвечает
     if img_bytes is None and photo_file_id and bot:
         log("🔁 Повторная попытка скачать фото для отложенной отправки...")
         img_bytes = await download_photo(bot, photo_file_id)
 
     if not text and not img_bytes:
         log("⏭ Delayed: фото так и не скачалось, текста нет — пропуск")
-        await finish()
-        return
-
+        return []
     if cancelled():
         log("🛑 Пост удалён через /posts — отложенная отправка отменена")
-        return
+        return []
 
-    # 1. Selfbot-каналы (паузы 7-10 сек между ними)
+    # отправки ставим в очереди каналов сразу; внутри поста — паузы 7-10 сек между каналами
+    tasks, at = [], time.time()
     if DISCORD_TOKEN:
         targets = [(n, all_channels[n]) for n in active_channels if n in all_channels]
         if not targets:
             log("⏭ Selfbot: нет активных каналов")
         for i, (name, channel_id) in enumerate(targets):
-            if cancelled():
-                log("🛑 Пост удалён через /posts — остаток selfbot-очереди отменён")
-                return
             if i > 0:
-                pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
-                log(f"  ⏸ Пауза {pause:.1f} сек перед {name}")
-                await asyncio.sleep(pause)
-            try:
-                if img_bytes:
-                    ok = await discord_send_photo(img_bytes, "photo.jpg", text, channel_id)
-                else:
-                    ok = await discord_send_text(text, channel_id)
-            except Exception as e:
-                log(f"❌ Selfbot {name} error: {repr(e)}")
-                ok = False
-            if isinstance(ok, str):
-                bundle_add(bundle, "selfbot", f"Selfbot {name}", channel_id, ok)
-            if report: report.add("🤖 Selfbot", name, bool(ok))
+                at += random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
+            tasks.append(_chain(f"selfbot:{channel_id}",
+                                lambda name=name, channel_id=channel_id, at=at:
+                                _selfbot_at(at, name, channel_id, text, img_bytes, report, bundle)))
+    if DISCORD_WEBHOOK_URL_2:
+        at += random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
+        tasks.append(_chain("rebel", lambda at=at: _rebel_at(at, text, img_bytes, report, bundle)))
+    return tasks
 
-    # 2. Webhook Rebel Angels — после selfbot-каналов
-    if DISCORD_WEBHOOK_URL_2 and not cancelled():
-        pause = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
-        log(f"⏸ Пауза {pause:.1f} сек перед Rebel Angels...")
-        await asyncio.sleep(pause)
+
+async def _selfbot_at(at: float, name: str, channel_id: str, text: str, img_bytes: Optional[bytes],
+                      report: Report, bundle: Optional[dict]):
+    if at > time.time():
+        await asyncio.sleep(at - time.time())
+    if bundle and bundle["deleted"]:
+        log(f"🛑 Пост удалён через /posts — {name} пропущен")
+        return
+    try:
+        if img_bytes:
+            ok = await discord_send_photo(img_bytes, "photo.jpg", text, channel_id)
+        else:
+            ok = await discord_send_text(text, channel_id)
+    except Exception as e:
+        log(f"❌ Selfbot {name} error: {repr(e)}")
+        ok = False
+    if isinstance(ok, str):
+        bundle_add(bundle, "selfbot", f"Selfbot {name}", channel_id, ok)
+    report.add("🤖 Selfbot", name, bool(ok))
+
+
+async def _rebel_at(at: float, text: str, img_bytes: Optional[bytes], report: Report, bundle: Optional[dict]):
+    if at > time.time():
+        await asyncio.sleep(at - time.time())
+    if bundle and bundle["deleted"]:
+        return
+    try:
+        ids = []
+        if img_bytes:
+            ids = await asyncio.to_thread(_send_webhook_photo, DISCORD_WEBHOOK_URL_2, text, img_bytes)
+            log("✅ Webhook Rebel Angels фото")
+        elif text:
+            ids = await asyncio.to_thread(_send_webhook_text, DISCORD_WEBHOOK_URL_2, text)
+            log("✅ Webhook Rebel Angels текст")
+        for mid in ids:
+            bundle_add(bundle, "webhook", "Webhook Rebel Angels", DISCORD_WEBHOOK_URL_2, mid)
+        report.add("🌐 Discord webhook", "Rebel Angels", True)
+    except Exception as e:
+        log(f"❌ Webhook Rebel Angels error: {repr(e)}")
+        report.add("🌐 Discord webhook", "Rebel Angels", False, str(e)[:60])
+
+
+async def _report_when_done(bot: Bot, report: Report, bundle: Optional[dict], tasks: list, launchers: list):
+    """Сводка — одна, когда закончились все отправки поста (каждая ограничена таймаутами)."""
+    until = time.time() + REPORT_MAX_WAIT
+    pending = [t for t in tasks if t is not None]
+    for launcher in launchers:
+        if launcher is None:
+            continue
         try:
-            ids = []
-            if img_bytes:
-                ids = await asyncio.to_thread(_send_webhook_photo, DISCORD_WEBHOOK_URL_2, text, img_bytes)
-                log("✅ Webhook Rebel Angels фото")
-            elif text:
-                ids = await asyncio.to_thread(_send_webhook_text, DISCORD_WEBHOOK_URL_2, text)
-                log("✅ Webhook Rebel Angels текст")
-            for mid in ids:
-                bundle_add(bundle, "webhook", "Webhook Rebel Angels", DISCORD_WEBHOOK_URL_2, mid)
-            if report: report.add("🌐 Discord webhook", "Rebel Angels", True)
+            pending += list(await asyncio.wait_for(asyncio.shield(launcher), max(1.0, until - time.time())) or [])
         except Exception as e:
-            log(f"❌ Webhook Rebel Angels error: {repr(e)}")
-            if report: report.add("🌐 Discord webhook", "Rebel Angels", False, str(e)[:60])
-
-    # 3. Сводка о доставке — в самом конце, когда всё отправлено
-    if not cancelled():
-        await finish()
+            log(f"⚠️ Сводка: часть отправок не запустилась: {repr(e)}")
+    if pending:
+        _, left = await asyncio.wait(pending, timeout=max(1.0, until - time.time()))
+        if left:
+            log(f"⚠️ Сводка: {len(left)} отправок не закончились за {REPORT_MAX_WAIT // 60} мин — шлю как есть")
+    if bundle and bundle["deleted"]:
+        return
+    await send_report(bot, report)
 
 
 # ── Команды ───────────────────────────────────────────────────────────────────
@@ -827,7 +878,7 @@ async def _delete_everywhere(bundle: dict, bot: Bot) -> list[tuple]:
     """
     Удаляем все сообщения связки по всем таргетам. Флаг deleted ставим
     ПЕРВЫМ делом — он же отменяет ещё не отправленные отложенные волны
-    (delayed_send / late_photo_wave проверяют его перед каждой отправкой).
+    (вторая волна фото, delayed_send и отправки в selfbot-каналы проверяют его).
     """
     bundle["deleted"] = True
     results = []
@@ -1595,108 +1646,83 @@ async def _wait_users_ready():
         pass
 
 
-async def _await_users(task: Optional[asyncio.Task]):
-    """Дождаться фоновых отправок аккаунтов (не дольше 5 минут), чтобы сводка была полной."""
-    if task is None:
-        return
-    try:
-        await asyncio.wait_for(asyncio.shield(task), 300)
-    except Exception as e:
-        log(f"⚠️ Отправки аккаунтов не завершились вовремя: {repr(e)}")
-
-
-async def send_user_text(text: str, report: Optional[Report] = None,
-                         bundle: Optional[dict] = None):
-    if not text:
-        return
+async def _launch_users(text: str, is_photo: bool, img_task: Optional[asyncio.Task],
+                        report: Report, bundle: Optional[dict]) -> list:
+    """По очереди на аккаунт: аккаунты друг друга не ждут, в каждом — посты по порядку."""
     await _wait_users_ready()
-    for acc in user_accounts:
-        if not await _ensure_connected(acc):
-            _report_account_down(acc, report, _down_reason(acc))
-            continue
+    return [_chain(f"user:{acc['name']}",
+                   lambda acc=acc: _user_account(acc, text, is_photo, img_task, report, bundle))
+            for acc in user_accounts if acc["targets"]]
 
-        def send_one(entity, topic, client=acc["client"]):
-            return client.send_message(entity, text, link_preview=False,
-                                       **({"reply_to": topic} if topic else {}))
+
+async def _user_account(acc, text: str, is_photo: bool, img_task: Optional[asyncio.Task],
+                        report: Report, bundle: Optional[dict]):
+    img = None
+    if is_photo:
+        img = await img_task
+        if not img:
+            # аккаунт — тоже «чужой» клиент, file_id бота ему не подходит → только байты
+            log(f"❌ Аккаунт {acc['name']}: нет байтов фото — пропуск")
+            for _, _, label in acc["targets"]:
+                report.add("📱 Telegram", label, False, "фото не скачалось")
+            return
+    elif not text:
+        return
+    if not await _ensure_connected(acc):
+        _report_account_down(acc, report, _down_reason(acc))
+        return
+    client = acc["client"]
+    if img:
+        def send_one(entity, topic):
+            bio = io.BytesIO(img)
+            bio.name = "photo.jpg"     # Telethon берёт расширение из имени
+            return client.send_file(entity, bio, caption=text or "", **({"reply_to": topic} if topic else {}))
+        await _user_send(acc, acc["targets"], send_one, USER_PHOTO_TIMEOUT, "photo", report, bundle)
+    else:
+        def send_one(entity, topic):
+            return client.send_message(entity, text, link_preview=False, **({"reply_to": topic} if topic else {}))
         await _user_send(acc, acc["targets"], send_one, USER_SEND_TIMEOUT, "text", report, bundle)
 
 
-async def send_user_photo(img_bytes: Optional[bytes], caption: Optional[str],
-                          report: Optional[Report] = None,
-                          bundle: Optional[dict] = None):
-    await _wait_users_ready()
-    if not any(acc["targets"] for acc in user_accounts):
+async def _photo_bytes(bot: Bot, file_id: str, bundle: Optional[dict] = None) -> Optional[bytes]:
+    """Байты фото — для всех, кроме TG #1 (ему хватает file_id). Не скачалось сразу
+    (Telegram лагал) — вторая волна через LATE_PHOTO_WAIT сек с длинной серией попыток."""
+    img = await download_photo(bot, file_id)
+    if img is None and not (bundle and bundle["deleted"]):
+        log(f"🔁 Вторая волна фото через {LATE_PHOTO_WAIT} сек...")
+        await asyncio.sleep(LATE_PHOTO_WAIT)
+        if not (bundle and bundle["deleted"]):
+            img = await download_photo(bot, file_id, attempts=5)
+    return img
+
+
+async def _send_heaven(context, is_photo: bool, dc_text: str, img_task: Optional[asyncio.Task],
+                       report: Report, bundle: Optional[dict]):
+    if is_photo:
+        # None send_tg_photo_heaven обрабатывает сам: лог + ❌ в сводке
+        await send_tg_photo_heaven(dc_text, await img_task, report, bundle)
+    elif dc_text:
+        await send_tg_text(context, "", dc_text, report, bundle)      # только TG #2 (Heaven)
+
+
+async def _send_webhook_bee(dc_text: str, img_task: Optional[asyncio.Task], report: Report,
+                            bundle: Optional[dict]):
+    if not DISCORD_WEBHOOK_URL:
         return
-    # аккаунт — тоже «чужой» клиент, file_id бота ему не подходит → только байты
-    if not img_bytes:
-        log("❌ Аккаунт-таргеты: нет байтов фото — пропуск")
-        if report:
-            for acc in user_accounts:
-                for _, _, label in acc["targets"]:
-                    report.add("📱 Telegram", label, False, "фото не скачалось")
-        return
-    for acc in user_accounts:
-        if not await _ensure_connected(acc):
-            _report_account_down(acc, report, _down_reason(acc))
-            continue
-
-        def send_one(entity, topic, client=acc["client"]):
-            bio = io.BytesIO(img_bytes)
-            bio.name = "photo.jpg"     # Telethon берёт расширение из имени
-            return client.send_file(entity, bio, caption=caption or "",
-                                    **({"reply_to": topic} if topic else {}))
-        await _user_send(acc, acc["targets"], send_one, USER_PHOTO_TIMEOUT, "photo", report, bundle)
-
-
-async def late_photo_wave(bot: Bot, file_id: str, dc_text: str,
-                          report: Optional[Report] = None,
-                          bundle: Optional[dict] = None):
-    """
-    Вторая волна: фото не скачалось с первого захода (Telegram лагал).
-    Ждём, пробуем снова с длинной серией ретраев и догоняем все таргеты,
-    которым нужны байты: Heaven, аккаунты, webhook Bee — а затем обычный
-    отложенный конвейер (Rebel Angels + selfbot). TG #1 к этому моменту
-    уже получил фото по file_id.
-    """
-    log(f"🔁 Вторая волна фото через {LATE_PHOTO_WAIT} сек...")
-    await asyncio.sleep(LATE_PHOTO_WAIT)
-
-    if bundle and bundle["deleted"]:
-        log("🛑 Пост удалён через /posts — вторая волна отменена")
-        return
-
-    img_bytes = await download_photo(bot, file_id, attempts=5)
-
-    # None оба сендера обрабатывают сами: лог + ❌ в сводке
-    await send_tg_photo_heaven(dc_text, img_bytes, report, bundle)
-    user_task = asyncio.create_task(send_user_photo(img_bytes, dc_text, report, bundle))
-
-    if DISCORD_WEBHOOK_URL:
-        try:
-            if img_bytes:
-                ids = await asyncio.to_thread(send_discord_webhook_photo, dc_text, img_bytes)
-                if report: report.add("🌐 Discord webhook", "Bee", True)
-            elif dc_text:
-                ids = await asyncio.to_thread(send_discord_webhook_text, dc_text)
-                if report: report.add("🌐 Discord webhook", "Bee", True)
-            else:
-                ids = []
-            for mid in ids:
-                bundle_add(bundle, "webhook", "Webhook Bee", DISCORD_WEBHOOK_URL, mid)
-        except Exception as e:
-            log(f"❌ Webhook Bee error: {repr(e)}")
-            if report: report.add("🌐 Discord webhook", "Bee", False, str(e)[:60])
-
-    if not dc_text and not img_bytes:
-        log("⏭ Вторая волна: фото так и не скачалось, текста нет — стоп")
-        await _await_users(user_task)
-        if report:
-            await send_report(bot, report)
-        return
-
-    # file_id передаём дальше: delayed_send сможет попробовать докачать
-    # ещё раз после своей задержки 2-3 мин
-    await delayed_send(dc_text, img_bytes, report, bot, file_id, bundle, user_task)
+    img = await img_task if img_task is not None else None
+    try:
+        ids = []
+        if img:
+            ids = await asyncio.to_thread(send_discord_webhook_photo, dc_text, img)
+            report.add("🌐 Discord webhook", "Bee", True)
+        elif dc_text:
+            ids = await asyncio.to_thread(send_discord_webhook_text, dc_text)
+            report.add("🌐 Discord webhook", "Bee", True)
+        for mid in ids:
+            bundle_add(bundle, "webhook", "Webhook Bee", DISCORD_WEBHOOK_URL, mid)
+    except Exception as e:
+        log(f"❌ Webhook Bee error: {repr(e)}")
+        report.add("🌐 Discord webhook", "Bee", False, str(e)[:60])
 
 
 # ── Handler ───────────────────────────────────────────────────────────────────
@@ -1735,59 +1761,32 @@ async def _handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYP
     report  = Report(preview)
     bundle  = new_bundle(preview)   # связка ID всех отправок — для /posts
 
-    # 1-2. Фото: TG #1 сразу по file_id (ему скачивание не нужно), потом
-    # качаем байты для остальных. Не скачалось — вторую волну в фон и выходим:
-    # она догонит Heaven, аккаунты, webhook Bee и отложенный конвейер.
-    img_bytes = None
-    if msg.photo:
-        file_id = msg.photo[-1].file_id
-        await send_tg_photo_main(context, file_id, tg_text, report, bundle)
-        img_bytes = await download_photo(context.bot, file_id)
-        if img_bytes is None:
-            asyncio.create_task(late_photo_wave(context.bot, file_id, dc_text, report, bundle))
-            return
-        await send_tg_photo_heaven(dc_text, img_bytes, report, bundle)
-    elif tg_text or dc_text:
-        await send_tg_text(context, tg_text, dc_text, report, bundle)
-    else:
-        log("⏭ Skip Telegram: empty")
-
-    # 2b. Telegram — от лица моих аккаунтов. Английский оригинал. В фоне: зависший или
-    # умерший аккаунт не должен задерживать Discord и остальные таргеты
-    user_task = None
-    if msg.photo:
-        user_task = asyncio.create_task(send_user_photo(img_bytes, dc_text, report, bundle))
-    elif dc_text:
-        user_task = asyncio.create_task(send_user_text(dc_text, report, bundle))
-
-    # 3. Discord webhook Bee (мгновенно)
-    if DISCORD_WEBHOOK_URL:
-        try:
-            ids = []
-            if img_bytes:
-                ids = await asyncio.to_thread(send_discord_webhook_photo, dc_text, img_bytes)
-                report.add("🌐 Discord webhook", "Bee", True)
-            elif dc_text:
-                ids = await asyncio.to_thread(send_discord_webhook_text, dc_text)
-                report.add("🌐 Discord webhook", "Bee", True)
-            for mid in ids:
-                bundle_add(bundle, "webhook", "Webhook Bee", DISCORD_WEBHOOK_URL, mid)
-        except Exception as e:
-            log(f"❌ Webhook Bee error: {repr(e)}")
-            report.add("🌐 Discord webhook", "Bee", False, str(e)[:60])
-
-    # 4. Задержка → Rebel Angels webhook → selfbot каналы (в фоне),
-    #    в самом конце — сводка о доставке. Если фото не скачалось,
-    #    file_id даёт delayed_send шанс докачать его после задержки.
-    photo_file_id = msg.photo[-1].file_id if msg.photo else None
-    if not dc_text and not img_bytes and not photo_file_id:
-        log("⏭ Skip delayed: empty")
-        await _await_users(user_task)
-        await send_report(context.bot, report)
+    # Отсчёт — с момента прихода поста. Каждое направление — своя очередь (см. _chain):
+    # TG #1 уходит сразу (фото — по file_id), Heaven, webhook Bee и аккаунты ждут только
+    # скачивания фото, selfbot-каналы и Rebel Angels — свою задержку от прихода поста.
+    arrived = time.time()
+    bot = context.bot
+    is_photo = bool(msg.photo)
+    file_id = msg.photo[-1].file_id if is_photo else None
+    if not is_photo and not (tg_text or dc_text):
+        log("⏭ Skip: пустой пост")
+        await send_report(bot, report)
         return
+    img_task = asyncio.create_task(_photo_bytes(bot, file_id, bundle)) if is_photo else None
 
-    asyncio.create_task(delayed_send(dc_text, img_bytes, report, context.bot, photo_file_id, bundle,
-                                     user_task))
+    tasks = []
+    if is_photo:
+        tasks.append(_chain("tg1", lambda: send_tg_photo_main(context, file_id, tg_text, report, bundle)))
+    elif tg_text:
+        tasks.append(_chain("tg1", lambda: send_tg_text(context, tg_text, "", report, bundle)))
+    launchers = []
+    if is_photo or dc_text:
+        tasks.append(_chain("heaven", lambda: _send_heaven(context, is_photo, dc_text, img_task, report, bundle)))
+        tasks.append(_chain("bee", lambda: _send_webhook_bee(dc_text, img_task, report, bundle)))
+        launchers.append(_chain("users", lambda: _launch_users(dc_text, is_photo, img_task, report, bundle)))
+        launchers.append(_chain("delayed", lambda: delayed_send(dc_text, img_task, report, bot, file_id,
+                                                                bundle, arrived)))
+    asyncio.create_task(_report_when_done(bot, report, bundle, tasks, launchers))
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
