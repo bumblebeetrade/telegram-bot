@@ -6,8 +6,12 @@ Telegram → Discord Bridge
   EN  — все остальные: TG #2 (Heaven), TG #3 (мой аккаунт),
         Discord webhook Bee, Rebel Angels, selfbot каналы
 
-Selfbot с задержкой 48-72 сек от прихода поста → каналы с паузами 7-10 сек →
+Selfbot через 10 сек от прихода поста → каналы с паузами 5-7 сек →
 webhook Rebel Angels → сводка в самом конце
+
+Картинки проверяются как у бота 5k-50k (image_filter.py): дальше уходят только
+карточки сделок и балансы; реклама, копитрейдинг, скрины Telegram/X/Discord — нет,
+всё сомнительное — админу с кнопкой «Всё равно переслать».
 Плюс таргеты от лица моих аккаунтов (Telethon)
 
 Каждое направление — своя очередь: посты в нём идут по порядку, направления
@@ -32,6 +36,7 @@ import html
 import json
 import asyncio
 import random
+import threading
 import time
 import requests
 import aiohttp
@@ -52,6 +57,8 @@ from telegram.ext import (
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+
+from image_filter import image_verdict, qr_text     # проверка картинок — как у бота 5k-50k
 
 BOT_TOKEN                  = os.getenv("BOT_TOKEN")
 BOT_TOKEN_2                = os.getenv("BOT_TOKEN_2", "")  # Heaven — для TG #2
@@ -103,10 +110,21 @@ ADMIN_IDS  = {int(x.strip()) for x in _admin_raw.split(",") if x.strip().isdigit
 _channels_raw = os.getenv("DISCORD_CHANNELS", "")
 
 DISCORD_API      = "https://discord.com/api/v9"
-SEND_DELAY_MIN   = 7
-SEND_DELAY_MAX   = 10
-BRIDGE_DELAY_MIN = 48
-BRIDGE_DELAY_MAX = 72
+# Selfbot-каналы и Rebel Angels: первый — через BRIDGE_DELAY сек от прихода поста,
+# дальше паузы SEND_DELAY сек между каналами (чтобы Discord не счёл это спамом)
+SEND_DELAY_MIN   = float(os.getenv("SEND_DELAY_MIN", "5") or "5")
+SEND_DELAY_MAX   = float(os.getenv("SEND_DELAY_MAX", "7") or "7")
+BRIDGE_DELAY_MIN = float(os.getenv("BRIDGE_DELAY_MIN", "10") or "10")
+BRIDGE_DELAY_MAX = float(os.getenv("BRIDGE_DELAY_MAX", "10") or "10")
+
+# Проверка картинок (OCR, как у бота 5k-50k):
+#   strict (по умолчанию) — дальше уходят только карточки сделок/ордеров и балансы;
+#          реклама и чужие скрины — блок, прочие картинки — админу на проверку;
+#   ads   — блок только рекламы и чужих скринов, остальные картинки уходят;
+#   off   — картинки не проверяются (как раньше).
+IMAGE_FILTER = os.getenv("IMAGE_FILTER", "strict").strip().lower()
+OCR_THREADS  = max(1, int(os.getenv("OCR_THREADS", "4") or "4"))
+HELD_KEEP    = 20        # сколько отсеянных постов помнить для кнопки «Всё равно переслать»
 
 # Slow mode на Discord-серверах (например Bulk Trade — 5 сек).
 # Повторяем ТОЛЬКО при 429; 403/404 повторять нельзя.
@@ -282,6 +300,15 @@ async def send_report(bot: Bot, report: Report):
     await _deliver_report(bot, report.render())
 
 
+def _sec(a: float, b: float) -> str:
+    return f"{a:g}" if a == b else f"{a:g}–{b:g}"
+
+
+def _delay_text() -> str:
+    return (f"{_sec(BRIDGE_DELAY_MIN, BRIDGE_DELAY_MAX)} сек от прихода поста, "
+            f"между каналами {_sec(SEND_DELAY_MIN, SEND_DELAY_MAX)} сек")
+
+
 async def send_blocked_report(bot: Bot, raw_text: str, reason: str):
     """Уведомление о посте, который целиком срезали фильтры."""
     if not REPORT_ENABLED or not REPORT_BLOCKED:
@@ -443,6 +470,151 @@ async def download_photo(bot: Bot, file_id: str, attempts: int = 0) -> Optional[
     return None
 
 
+# ── Проверка картинок ────────────────────────────────────────────────────────
+
+_ocr = None
+_ocr_lock = threading.Lock()          # один OCR за раз
+# график: пара TradingView («Bitcoin / TetherUS», «… / U.S. Dollar») или экран сделки на бирже
+# («Last Price», «24h High», «Funding Rate») — в истории канала это всегда сетап сделки
+CHART_RE = re.compile(r"/\s*(?:u\.?s\.?\s*dollar|tetherus)|24h\s*(?:high|low)|last\s*price|funding\s*rate")
+
+
+def _ocr_load():
+    global _ocr
+    if _ocr is None:
+        from rapidocr_onnxruntime import RapidOCR
+        # потоков — не больше, чем даёт Railway: лишние только мешают друг другу
+        _ocr = RapidOCR(intra_op_num_threads=OCR_THREADS, inter_op_num_threads=1)
+        log(f"🔤 OCR загружен (потоков: {OCR_THREADS})")
+
+
+def _ocr_warmup():
+    """Загрузить OCR сразу при старте — чтобы первая карточка не ждала загрузки модели."""
+    try:
+        with _ocr_lock:
+            _ocr_load()
+    except Exception as e:
+        log(f"⚠️ OCR не загрузился при старте: {repr(e)} — попробую на первой картинке")
+
+
+def _ocr_lines(data: bytes) -> list:
+    with _ocr_lock:
+        _ocr_load()
+        res, _ = _ocr(data)
+    return [r[1] for r in (res or [])]
+
+
+async def check_image(data: bytes) -> tuple:
+    """(решение, пояснение): pass — карточка сделки, уходит; block — реклама / чужой скрин;
+    review — не похоже на карточку или не удалось проверить: решает админ."""
+    if IMAGE_FILTER == "off":
+        return "pass", "проверка картинок выключена"
+    t0 = time.time()
+    try:
+        lines = await asyncio.to_thread(_ocr_lines, data)
+    except Exception as e:
+        log(f"⚠️ OCR ошибка: {repr(e)}")
+        return "review", "картинку не удалось проверить (OCR)"
+    qr = await asyncio.to_thread(qr_text, data)
+    ok, why = image_verdict(lines, qr)
+    log(f"🔤 {' | '.join(lines)[:160]!r}{' + QR' if qr else ''} → {'✅' if ok else '⛔'} {why} "
+        f"({time.time() - t0:.1f} с)")
+    if not ok:
+        return "block", why
+    if IMAGE_FILTER == "strict" and why not in ("карточка позиции / ордера", "скрин баланса / счёта"):
+        # график с позицией (TradingView «Bitcoin / TetherUS», экран сделки на бирже) — тоже сигнал
+        if why == "картинка без промо-признаков" and CHART_RE.search(" ".join(lines).lower()):
+            return "pass", "график / экран сделки"
+        return "review", f"не похоже на карточку сделки ({why})"
+    return "pass", why
+
+
+async def _photo_verdict(img_task: asyncio.Task) -> tuple:
+    """(решение, пояснение) для фото поста — после скачивания (со второй волной)."""
+    img = await img_task
+    if img is None:
+        return "review", "фото не скачалось — не проверено"
+    return await check_image(img)
+
+
+async def _if_pass(verdict_task: Optional[asyncio.Task], make):
+    """Отправка в направление — только если картинка прошла проверку (у текста проверки нет)."""
+    if verdict_task is not None and (await verdict_task)[0] != "pass":
+        return None
+    return await make()
+
+
+# Отсеянные посты с картинкой — для кнопки «Всё равно переслать»
+held_posts: deque = deque(maxlen=HELD_KEEP)
+_held_seq: int = 0
+_held_done: dict = {}         # uid → что с ним сделали (кнопку могли нажать несколько админов)
+
+
+async def _report_held(bot: Bot, status: str, why: str, post: dict):
+    """Пост с картинкой не ушёл: админу — картинка, причина и кнопки."""
+    global _held_seq
+    _held_seq += 1
+    post = dict(post, uid=_held_seq, why=why)
+    held_posts.append(post)
+    head = ("⛔ <b>Не переслано — картинка</b>" if status == "block" else
+            "✋ <b>Нужна ваша проверка — картинка</b>")
+    caption = (f"{head} · {_hm()}\n{html.escape(why)}\n\n"
+               f"<i>{html.escape((post['dc_text'] or post['tg_text'] or '(без текста)')[:600])}</i>")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Всё равно переслать", callback_data=f"hforce:{_held_seq}"),
+                                InlineKeyboardButton("🗑 Убрать", callback_data=f"hdrop:{_held_seq}")]])
+    log(f"{'⛔' if status == 'block' else '✋'} пост с картинкой не переслан: {why}")
+    if status == "block" and not (REPORT_ENABLED and REPORT_BLOCKED):
+        return
+    for chat_id in _report_targets():
+        try:
+            await bot.send_photo(chat_id=chat_id, photo=post["file_id"], caption=caption[:1024],
+                                 parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception as e:
+            log(f"❌ Отсеянный пост → {chat_id}: {repr(e)}")
+
+
+async def cb_held_force(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("Нет доступа.")
+        return
+    uid = int(query.data.split(":")[1])
+    post = next((p for p in held_posts if p["uid"] == uid), None)
+    if post is None:
+        await query.answer(f"Уже {_held_done[uid]}." if uid in _held_done else
+                           "Этого поста уже нет в памяти (бот перезапускался).", show_alert=True)
+        return
+    held_posts.remove(post)
+    _held_done[uid] = "переслано"
+    await query.answer("Пересылаю во все таргеты…")
+    log(f"✅ Админ разрешил пост с картинкой ({post['why']}) — пересылаю")
+    await _dispatch(ctx, post["tg_text"], post["dc_text"], post["file_id"], force=True)
+    try:
+        await query.edit_message_caption(caption=f"✅ Переслано вручную · {_hm()}\n{html.escape(post['why'])}",
+                                         parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+
+async def cb_held_drop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("Нет доступа.")
+        return
+    uid = int(query.data.split(":")[1])
+    post = next((p for p in held_posts if p["uid"] == uid), None)
+    if post is None:
+        await query.answer(f"Уже {_held_done[uid]}." if uid in _held_done else "Уже убрано.")
+        return
+    held_posts.remove(post)
+    _held_done[uid] = "убрано"
+    await query.answer("Убрано")
+    try:
+        await query.edit_message_caption(caption=f"🗑 Не пересылаем · {_hm()}", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+
 # ── Конвейер поста ────────────────────────────────────────────────────────────
 #
 # Каждое направление — TG #1, Heaven, webhook Bee, каждый аккаунт, каждый selfbot-канал,
@@ -471,8 +643,9 @@ def _chain(name: str, make) -> asyncio.Task:
 
 async def delayed_send(text: str, img_task: Optional[asyncio.Task], report: Report, bot: Optional[Bot],
                        photo_file_id: Optional[str], bundle: Optional[dict], arrived: float) -> list:
-    """Задержка 48-72 сек от прихода поста → selfbot-каналы (паузы 7-10 сек) → пауза →
-    Rebel Angels. Ставит отправки в очереди каналов и возвращает их — сводка их дождётся."""
+    """Задержка BRIDGE_DELAY (10 сек) от прихода поста → selfbot-каналы (паузы SEND_DELAY,
+    5-7 сек) → пауза → Rebel Angels. Ставит отправки в очереди каналов и возвращает их —
+    сводка их дождётся."""
     global _last_deadline
 
     def cancelled() -> bool:
@@ -566,8 +739,17 @@ async def _rebel_at(at: float, text: str, img_bytes: Optional[bytes], report: Re
         report.add("🌐 Discord webhook", "Rebel Angels", False, str(e)[:60])
 
 
-async def _report_when_done(bot: Bot, report: Report, bundle: Optional[dict], tasks: list, launchers: list):
-    """Сводка — одна, когда закончились все отправки поста (каждая ограничена таймаутами)."""
+async def _report_when_done(bot: Bot, report: Report, bundle: Optional[dict], tasks: list, launchers: list,
+                            verdict_task: Optional[asyncio.Task] = None, post: Optional[dict] = None):
+    """Сводка — одна, когда закончились все отправки поста (каждая ограничена таймаутами).
+    Картинка не прошла проверку — вместо сводки админу картинка, причина и кнопки."""
+    if verdict_task is not None:
+        status, why = await verdict_task
+        if status != "pass":
+            if bundle in sent_posts:
+                sent_posts.remove(bundle)              # ничего не отправлено — в /posts ему не место
+            await _report_held(bot, status, why, post)
+            return
     until = time.time() + REPORT_MAX_WAIT
     pending = [t for t in tasks if t is not None]
     for launcher in launchers:
@@ -596,7 +778,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📡 <b>Signal Bot</b>\n\n"
         f"Автопересылка: {status}\n"
         f"Активных каналов: {len(active_channels)} из {len(all_channels)}\n"
-        f"Задержка: {BRIDGE_DELAY_MIN}–{BRIDGE_DELAY_MAX} сек\n\n"
+        f"Задержка: {_delay_text()}\n\n"
         "/channels — каналы (вкл/выкл)\n"
         "/addchannel &lt;название&gt; &lt;id&gt; — добавить канал\n"
         "/removechannel &lt;название&gt; — удалить канал\n"
@@ -805,7 +987,7 @@ async def cmd_bridge(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     label = "🟢 Вкл" if bridge_enabled else "🔴 Выкл"
     await update.message.reply_text(
-        f"🌉 <b>Автопересылка в Discord</b>\n\nСтатус: {label}\nЗадержка: {BRIDGE_DELAY_MIN}–{BRIDGE_DELAY_MAX} сек",
+        f"🌉 <b>Автопересылка в Discord</b>\n\nСтатус: {label}\nЗадержка: {_delay_text()}",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data="bridge_toggle")]]),
         parse_mode="HTML",
     )
@@ -821,7 +1003,7 @@ async def cb_bridge_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     label = "🟢 Вкл" if bridge_enabled else "🔴 Выкл"
     await query.answer("Включено ✅" if bridge_enabled else "Выключено ❌")
     await query.edit_message_text(
-        f"🌉 <b>Автопересылка в Discord</b>\n\nСтатус: {label}\nЗадержка: {BRIDGE_DELAY_MIN}–{BRIDGE_DELAY_MAX} сек",
+        f"🌉 <b>Автопересылка в Discord</b>\n\nСтатус: {label}\nЗадержка: {_delay_text()}",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data="bridge_toggle")]]),
         parse_mode="HTML",
     )
@@ -857,7 +1039,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"Discord: <code>{tag}</code>\n"
                     f"Аккаунты (чатов): {user_state}\n"
                     f"Автопересылка: {status}\n"
-                    f"Задержка: {BRIDGE_DELAY_MIN}–{BRIDGE_DELAY_MAX} сек\n\n"
+                    f"Задержка: {_delay_text()}\n\n"
                     f"Каналы:\n{ch_list}",
                     parse_mode="HTML",
                 )
@@ -1497,6 +1679,8 @@ async def user_init(app):
     global APP_BOT
     APP_BOT = app.bot
     asyncio.create_task(_user_init_later())
+    if IMAGE_FILTER != "off":
+        asyncio.create_task(asyncio.to_thread(_ocr_warmup))
 
 
 async def _user_init_later():
@@ -1754,39 +1938,47 @@ async def _handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYP
 
     tg_text = transform_for_telegram(raw_text)
     dc_text = transform_for_discord(raw_text) or ""
+    file_id = msg.photo[-1].file_id if msg.photo else None
+    await _dispatch(context, tg_text, dc_text, file_id)
 
+
+async def _dispatch(context, tg_text: str, dc_text: str, file_id: Optional[str], force: bool = False):
+    """Рассылка поста по всем направлениям. force — админ разрешил картинку вручную."""
     # Сводка о доставке — копится по ходу, уходит в самом конце.
     # В превью — английский оригинал (dc_text), русский только запасной вариант.
     preview = (dc_text or tg_text or "фото").splitlines()[0][:60] if (dc_text or tg_text) else "фото"
     report  = Report(preview)
     bundle  = new_bundle(preview)   # связка ID всех отправок — для /posts
 
-    # Отсчёт — с момента прихода поста. Каждое направление — своя очередь (см. _chain):
-    # TG #1 уходит сразу (фото — по file_id), Heaven, webhook Bee и аккаунты ждут только
-    # скачивания фото, selfbot-каналы и Rebel Angels — свою задержку от прихода поста.
+    # Отсчёт — с момента прихода поста. Каждое направление — своя очередь (см. _chain).
+    # Фото: сначала проверка картинки (скачивание + OCR, несколько секунд) — дальше уходит
+    # только то, что прошло; selfbot-каналы и Rebel Angels — через свою задержку от прихода.
     arrived = time.time()
     bot = context.bot
-    is_photo = bool(msg.photo)
-    file_id = msg.photo[-1].file_id if is_photo else None
+    is_photo = bool(file_id)
     if not is_photo and not (tg_text or dc_text):
         log("⏭ Skip: пустой пост")
         await send_report(bot, report)
         return
     img_task = asyncio.create_task(_photo_bytes(bot, file_id, bundle)) if is_photo else None
+    verdict_task = (asyncio.create_task(_photo_verdict(img_task))
+                    if is_photo and not force else None)
+    gate = lambda make: (lambda: _if_pass(verdict_task, make))
 
     tasks = []
     if is_photo:
-        tasks.append(_chain("tg1", lambda: send_tg_photo_main(context, file_id, tg_text, report, bundle)))
+        tasks.append(_chain("tg1", gate(lambda: send_tg_photo_main(context, file_id, tg_text, report, bundle))))
     elif tg_text:
         tasks.append(_chain("tg1", lambda: send_tg_text(context, tg_text, "", report, bundle)))
     launchers = []
     if is_photo or dc_text:
-        tasks.append(_chain("heaven", lambda: _send_heaven(context, is_photo, dc_text, img_task, report, bundle)))
-        tasks.append(_chain("bee", lambda: _send_webhook_bee(dc_text, img_task, report, bundle)))
-        launchers.append(_chain("users", lambda: _launch_users(dc_text, is_photo, img_task, report, bundle)))
-        launchers.append(_chain("delayed", lambda: delayed_send(dc_text, img_task, report, bot, file_id,
-                                                                bundle, arrived)))
-    asyncio.create_task(_report_when_done(bot, report, bundle, tasks, launchers))
+        tasks.append(_chain("heaven", gate(lambda: _send_heaven(context, is_photo, dc_text, img_task, report, bundle))))
+        tasks.append(_chain("bee", gate(lambda: _send_webhook_bee(dc_text, img_task, report, bundle))))
+        launchers.append(_chain("users", gate(lambda: _launch_users(dc_text, is_photo, img_task, report, bundle))))
+        launchers.append(_chain("delayed", gate(lambda: delayed_send(dc_text, img_task, report, bot, file_id,
+                                                                     bundle, arrived))))
+    post = {"tg_text": tg_text, "dc_text": dc_text, "file_id": file_id}
+    asyncio.create_task(_report_when_done(bot, report, bundle, tasks, launchers, verdict_task, post))
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
@@ -1816,6 +2008,8 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_post_del,         pattern=r"^pdel:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_ch_toggle,     pattern=r"^chtoggle:"))
     app.add_handler(CallbackQueryHandler(cb_bridge_toggle, pattern=r"^bridge_toggle$"))
+    app.add_handler(CallbackQueryHandler(cb_held_force,    pattern=r"^hforce:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_held_drop,     pattern=r"^hdrop:\d+$"))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
 
     print("🚀 Signal filter bot started", flush=True)
