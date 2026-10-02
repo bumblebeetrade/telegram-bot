@@ -58,7 +58,7 @@ from telegram.ext import (
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-from image_filter import image_verdict, qr_text     # проверка картинок — как у бота 5k-50k
+from image_filter import CARD_KEYWORDS, image_verdict, qr_text     # проверка картинок — как у бота 5k-50k
 
 BOT_TOKEN                  = os.getenv("BOT_TOKEN")
 BOT_TOKEN_2                = os.getenv("BOT_TOKEN_2", "")  # Heaven — для TG #2
@@ -476,7 +476,24 @@ _ocr = None
 _ocr_lock = threading.Lock()          # один OCR за раз
 # график: пара TradingView («Bitcoin / TetherUS», «… / U.S. Dollar») или экран сделки на бирже
 # («Last Price», «24h High», «Funding Rate») — в истории канала это всегда сетап сделки
-CHART_RE = re.compile(r"/\s*(?:u\.?s\.?\s*dollar|tetherus)|24h\s*(?:high|low)|last\s*price|funding\s*rate")
+CHART_RE = re.compile(r"/\s*(?:u\.?s\.?\s*dollar|tetherus)|24h\s*(?:high|low)|last\s*price|funding\s*rate"
+                      # подпись TradingView «BTCUSDT.P · 1h · BINANCE», «ETHUSDT SPOT · 1D · Bybit»
+                      r"|[a-z0-9]{2,12}usdt(?:\.p|\s?spot|\s?perp)?\s*[·•|.,\-]?\s*\d{1,3}\s?[mhdw](?![a-z])"
+                      # строка свечи TradingView «O2,687.88 H2,743.21 L2,667.04 C2,742.05»
+                      r"|(?<![a-z])o\s?[\d,.]{3,}\s*h\s?[\d,.]{3,}\s*l\s?[\d,.]{3,}\s*c\s?[\d,.]{3,}")
+# оси графика без подписей (тепловая карта ликвидаций и т. п.): цены по оси и метки времени
+AXIS_PRICE_RE = re.compile(r"(?<![\d.,])\d{1,3}(?:,\d{3})+(?:\.\d+)?(?![\d,])|(?<![\d.,])\d{4,6}(?:\.\d+)?(?![\d,])")
+AXIS_TIME_RE = re.compile(r"\d{2}-\d{2}\s?\d{1,2}:\d{2}|(?<!\d)\d{1,2}:\d{2}(?!\d)")
+# сигнал, написанный на картинке: направление и уровни («Long BTC / Entry 64k / SL 62k»)
+SIGNAL_SIDE_RE = re.compile(r"(?<![a-z])(?:long|short|longed|shorted)(?![a-z])")
+SIGNAL_LEVEL_RE = re.compile(r"(?<![a-z])(?:entry|entries|sl|stop|stops|tp|take\s*profit|dca|target)(?![a-z])")
+
+
+def _card_like(low: str) -> bool:
+    """Карточка позиции/ордера — та же примета, что в image_filter (пара …USDT и поля сделки)."""
+    compact = low.replace(" ", "")
+    hits = sum(1 for k in CARD_KEYWORDS if k.replace(" ", "") in compact)
+    return bool(re.search(r"[a-z0-9]{2,12}usdt", compact)) and hits >= 2
 
 
 def _ocr_load():
@@ -519,12 +536,20 @@ async def check_image(data: bytes) -> tuple:
     ok, why = image_verdict(lines, qr)
     log(f"🔤 {' | '.join(lines)[:160]!r}{' + QR' if qr else ''} → {'✅' if ok else '⛔'} {why} "
         f"({time.time() - t0:.1f} с)")
+    low = " ".join(lines).lower()
     if not ok:
+        # единственная причина — название биржи, а на картинке карточка сделки или график
+        # («Bitget Futures» в шапке карточки, «BTCUSDT.P · 1h · BINANCE» на TradingView) — это сигнал
+        if re.fullmatch(r"бренд биржи «[^»]+»", why) and (_card_like(low) or CHART_RE.search(low)):
+            return "pass", f"карточка / график с названием биржи ({why})"
         return "block", why
     if IMAGE_FILTER == "strict" and why not in ("карточка позиции / ордера", "скрин баланса / счёта"):
-        # график с позицией (TradingView «Bitcoin / TetherUS», экран сделки на бирже) — тоже сигнал
-        if why == "картинка без промо-признаков" and CHART_RE.search(" ".join(lines).lower()):
-            return "pass", "график / экран сделки"
+        if why == "картинка без промо-признаков":
+            # график с позицией (TradingView, экран сделки на бирже) — тоже сигнал
+            if CHART_RE.search(low) or (len(AXIS_PRICE_RE.findall(low)) >= 5 and len(AXIS_TIME_RE.findall(low)) >= 2):
+                return "pass", "график / экран сделки"
+            if SIGNAL_SIDE_RE.search(low) and SIGNAL_LEVEL_RE.search(low):
+                return "pass", "сигнал на картинке (направление и уровни)"
         return "review", f"не похоже на карточку сделки ({why})"
     return "pass", why
 
