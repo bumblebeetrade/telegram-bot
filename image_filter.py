@@ -85,11 +85,13 @@ SOCIAL_RE = [
     (r"today\s?at\s?\d{1,2}:\d{2}", "скрин Discord"),
 ]
 # Лента Telegram: под каждым постом «просмотры время» («382 2:55 PM»), между днями — «September 13».
-# Одна такая подпись бывает и у карточки с подписью трейдера — поэтому нужно ≥2 подписи
-# или подпись + дата-разделитель (одиночную карточку не режем).
-TG_FOOTER_RE = r"\d{1,6}\s?\d{1,2}:\d{2}\s?(?:am|pm)(?![a-z])"
-TG_DATE_RE = (r"(?:january|february|march|april|may|june|july|august|september|october|november|december)"
-              r"\s?\d{1,2}(?!\d)")
+# 20.11.2026 трейдер выложил скрин своего же поста в канале с карточкой — такие не пересылаем
+# вовсе, хватает одной подписи. OCR читает её по-разному: «O1027:03AM» (глаз — как «O»),
+# «66 7:05.AM9» (точка вместо пробела).
+TG_FOOTER_RE = r"\d{1,6}\s?\d{1,2}[:.]\d{2}[\s.]?(?:am|pm)(?![a-z])"
+# время в 12-часовом формате («7:03 AM») — интерфейс Telegram или X; на карточках бирж и
+# графиках его нет (проверено на картинках канала 5k-50k и X за сентябрь–ноябрь 2026)
+AMPM_RE = r"(?<![\d:])\d{1,2}[:.]\d{2}\s?\.?\s?(?:am|pm)(?![a-z])"
 # бренды, которые ищем и «почти точно» — OCR теряет буквы («Bitunx» вместо «Bitunix»)
 FUZZY_BRANDS = [b for b in IMAGE_BRANDS if len(b) >= 6 and "." not in b]
 
@@ -124,7 +126,9 @@ def image_verdict(ocr_lines: list[str], qr: str = "") -> tuple[bool, str]:
     """(пропустить?, пояснение). Причины собираются все сразу — чтобы было видно,
     что картинка не просто «с логотипом биржи», а, например, чужой канал с промокодом."""
     joined = " ".join(ocr_lines)
-    low = joined.lower()
+    # «Crypto_Arki»: подчёркивание для регулярок — часть слова, «arki» отдельным словом не
+    # находилось (20.11 так прошёл скрин его канала в 5k-50k) — считаем его пробелом
+    low = joined.lower().replace("_", " ")
     compact = low.replace(" ", "")
     # причины группируем: «профиль копитрейдинга (followers, AUM, profit sharing)», без повторов
     reasons: dict = {}
@@ -163,9 +167,10 @@ def image_verdict(ocr_lines: list[str], qr: str = "") -> tuple[bool, str]:
     for pattern, why in TG_UI_RE + PROMO_RE + SOCIAL_RE:
         if re.search(pattern, low) or re.search(pattern, compact):
             add(why)
-    footers = max(len(re.findall(TG_FOOTER_RE, low)), len(re.findall(TG_FOOTER_RE, compact)))
-    if footers >= 2 or (footers and re.search(TG_DATE_RE, compact)):
-        add("скрин Telegram-канала (просмотры и время постов)")
+    if re.search(TG_FOOTER_RE, low) or re.search(TG_FOOTER_RE, compact):
+        add("скрин Telegram-канала (просмотры и время поста)")
+    elif re.search(AMPM_RE, low) or re.search(AMPM_RE, compact):
+        add("скрин ленты соцсети (время поста)")
     if qr:
         add("QR-код со ссылкой")
     if reasons:
