@@ -58,7 +58,9 @@ from telegram.ext import (
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-from image_filter import CARD_KEYWORDS, image_verdict, qr_text     # проверка картинок — как у бота 5k-50k
+# фильтр текста и картинок — общий файл с ботом 5k-50k (там он filters.py)
+from image_filter import CARD_KEYWORDS, cut_ad_tail, image_verdict, qr_text, text_block_reason
+import pings                     # тег роли Discord на важные действия трейдера (DISCORD_PING) — как у 5k-50k
 
 BOT_TOKEN                  = os.getenv("BOT_TOKEN")
 BOT_TOKEN_2                = os.getenv("BOT_TOKEN_2", "")  # Heaven — для TG #2
@@ -309,17 +311,19 @@ def _delay_text() -> str:
             f"между каналами {_sec(SEND_DELAY_MIN, SEND_DELAY_MAX)} сек")
 
 
-async def send_blocked_report(bot: Bot, raw_text: str, reason: str):
-    """Уведомление о посте, который целиком срезали фильтры."""
+async def send_blocked_report(bot: Bot, raw_text: str, reason: str, sent: str = ""):
+    """Уведомление о посте, который срезали фильтры. sent — сигнал без рекламного хвоста,
+    который всё-таки ушёл (хвост вырезан)."""
     if not REPORT_ENABLED or not REPORT_BLOCKED:
         return
-    preview = " / ".join(
-        line.strip() for line in raw_text.splitlines() if line.strip()
-    )[:200] or "(без текста)"
+    flat = lambda s: " / ".join(line.strip() for line in s.splitlines() if line.strip())[:200]
+    preview = flat(raw_text) or "(без текста)"
+    head = "✂️ <b>Вырезан рекламный хвост — сигнал ушёл</b>" if sent else "🚫 <b>Пост отфильтрован</b>"
     text = (
-        f"🚫 <b>Пост отфильтрован</b> · {_hm()}\n"
+        f"{head} · {_hm()}\n"
         f"<i>{html.escape(preview)}</i>\n\n"
         f"Причина: <code>{html.escape(reason)}</code>"
+        + (f"\nУшло: <i>{html.escape(flat(sent))}</i>" if sent else "")
     )
     await _deliver_report(bot, text)
 
@@ -667,10 +671,12 @@ def _chain(name: str, make) -> asyncio.Task:
 
 
 async def delayed_send(text: str, img_task: Optional[asyncio.Task], report: Report, bot: Optional[Bot],
-                       photo_file_id: Optional[str], bundle: Optional[dict], arrived: float) -> list:
+                       photo_file_id: Optional[str], bundle: Optional[dict], arrived: float,
+                       ping: Optional[str] = None) -> list:
     """Задержка BRIDGE_DELAY (10 сек) от прихода поста → selfbot-каналы (паузы SEND_DELAY,
     5-7 сек) → пауза → Rebel Angels. Ставит отправки в очереди каналов и возвращает их —
-    сводка их дождётся."""
+    сводка их дождётся. ping — тег роли (pings.py): в каналы из DISCORD_PING текст уходит
+    с тегом последней строкой."""
     global _last_deadline
 
     def cancelled() -> bool:
@@ -716,7 +722,7 @@ async def delayed_send(text: str, img_task: Optional[asyncio.Task], report: Repo
                 at += random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
             tasks.append(_chain(f"selfbot:{channel_id}",
                                 lambda name=name, channel_id=channel_id, at=at:
-                                _selfbot_at(at, name, channel_id, text, img_bytes, report, bundle)))
+                                _selfbot_at(at, name, channel_id, text, img_bytes, report, bundle, ping)))
     if DISCORD_WEBHOOK_URL_2:
         at += random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
         tasks.append(_chain("rebel", lambda at=at: _rebel_at(at, text, img_bytes, report, bundle)))
@@ -724,12 +730,16 @@ async def delayed_send(text: str, img_task: Optional[asyncio.Task], report: Repo
 
 
 async def _selfbot_at(at: float, name: str, channel_id: str, text: str, img_bytes: Optional[bytes],
-                      report: Report, bundle: Optional[dict]):
+                      report: Report, bundle: Optional[dict], ping: Optional[str] = None):
     if at > time.time():
         await asyncio.sleep(at - time.time())
     if bundle and bundle["deleted"]:
         log(f"🛑 Пост удалён через /posts — {name} пропущен")
         return
+    role = pings.role_for(name, channel_id) if ping else None
+    if role:
+        text = pings.with_tag(text, role)
+        log(f"🔔 {name}: тег роли ({ping})")
     try:
         if img_bytes:
             ok = await discord_send_photo(img_bytes, "photo.jpg", text, channel_id)
@@ -740,7 +750,7 @@ async def _selfbot_at(at: float, name: str, channel_id: str, text: str, img_byte
         ok = False
     if isinstance(ok, str):
         bundle_add(bundle, "selfbot", f"Selfbot {name}", channel_id, ok)
-    report.add("🤖 Selfbot", name, bool(ok))
+    report.add("🤖 Selfbot", f"{name} 🔔" if role else name, bool(ok))
 
 
 async def _rebel_at(at: float, text: str, img_bytes: Optional[bytes], report: Report, bundle: Optional[dict]):
@@ -1051,7 +1061,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 status = "🟢 Вкл" if bridge_enabled else "🔴 Выкл"
                 ch_list = "\n".join(
                     f"  {'✅' if n in active_channels else '⬜'} {n}"
-                    for n in all_channels
+                    + (" 🔔 тег роли на сделки" if pings.role_for(n, cid) else "")
+                    for n, cid in all_channels.items()
                 ) or "  нет каналов"
                 if user_accounts:
                     user_state = "🟢 " + ", ".join(
@@ -1218,128 +1229,11 @@ async def cb_post_del_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Фильтр ────────────────────────────────────────────────────────────────────
 
 def block_reason(raw_text: str) -> Optional[str]:
-    """Причина, по которой пост режется целиком. None — пост проходит."""
-    if not raw_text or len(raw_text.strip()) < 3:
-        return None
-
-    text = html.unescape(raw_text).lower()
-    text = re.sub(r"\s+", " ", text).strip()
-
-    blocked_phrases = [
-        "crypto arki", "arkii trades", "arkiitrades",
-        "blofin copy trading username", "copy trading username",
-        "copy trading", "copy-trading", "copytrade", "copy trade",
-        "copy trader", "copy my trades", "you can copy my trades",
-        "join copy trading", "1st trade running in copy",
-        "blofin", "bybit referral", "okx referral",
-        "profit sharing ratio", "strategy cycle",
-        "sign up using", "signup & deposit", "sign up & deposit",
-        "signup and deposit", "sign up and deposit",
-        "how to join", "steps & conditions to follow",
-        "steps and conditions to follow",
-        "minimum $100", "deposit",
-        "trade responsibly", "limited slots",
-        "full transparency", "same entries", "same exits",
-        "paid group",
-        "i will add them",
-        "add them in my",
-        "whoever joined",
-        "hope still you believe",
-        "1-2 trades per day",
-        "interested people can join", "people can join",
-        "i will take trades here", "not including 200-2k",
-        "i'm using 300$ here", "im using 300$ here",
-        "join fast my telegram channel", "join fast telegram channel",
-        "join my telegram channel", "join our telegram channel",
-        "join telegram channel", "join my telegram group", "join telegram group",
-        "telegram channel in bio", "telegram in bio",
-        "twitter in bio", "x in bio",
-        "share live trades", "live trades no paid/free group",
-        "no paid/free group", "never dm first", "dm first",
-        "telegram",
-        "https://", "http://",
-
-        # ── Биржи и платформы (в обычных сигналах не упоминаются) ──
-        "bitunix", "binance", "bybit", "okx", "bitget", "kucoin", "mexc",
-        "gate.io", "gateio", "htx", "huobi", "bingx", "phemex", "deribit",
-        "coinex", "kraken", "coinbase", "bitmex", "bitfinex", "lbank",
-        "pionex", "toobit", "weex", "bitrue", "whitebit", "hyperliquid",
-        "bitmart", "poloniex", "bitstamp", "upbit", "bithumb",
-        "platform", "exchange",
-
-        # ── Рефералки, промокоды, комиссии ──
-        "referral", "referal", "ref link", "ref code",
-        "promo code", "promocode", "bonus code", "use code", "my code",
-        "affiliate", "commission", "management fee",
-        "profit share", "pnl share", "bonus",
-
-        # ── VIP / платные группы, подписки, обучение ──
-        "vip signal", "vip group", "vip channel", "vip member",
-        "premium group", "premium signal", "premium channel",
-        "subscription", "subscribe",
-        "mentorship", "webinar", "masterclass", "academy", "trading course",
-        "lifetime access", "free access", "free signal", "free trial",
-        "prop firm", "funded account",
-
-        # ── Призывы написать / вступить ──
-        "dm me", "pm me", "inbox me", "message me", "text me", "contact me",
-        "reach out", "link in bio", "check bio", "bio link", "in bio",
-        "join now", "join us", "join here", "invite link", "invite you",
-        "my channel", "my group", "our channel", "our group",
-        "trade with me", "trade with us", "copy me", "follow my trades",
-
-        # ── Регистрация на площадках ──
-        "sign up", "signup", "register", "registration",
-        "create account", "open account", "new account",
-
-        # ── Соцсети и мессенджеры ──
-        "discord.gg", "whatsapp", "instagram", "youtube", "tiktok",
-        "facebook", "snapchat",
-
-        # ── Маркетинговое давление ──
-        # NB: слова уточнены — голые "hurry" / "guarantee" / "last chance"
-        # ловили обычные комментарии трейдера («I m not in Hurry...»)
-        "guaranteed profit", "guaranteed return", "risk free",
-        "slots left", "seats left", "spots left",
-        "last chance to join", "limited time offer", "hurry up",
-        "click here", "swipe up", "tap the link",
-        "double your", "10x your",
-    ]
-
-    for phrase in blocked_phrases:
-        if phrase in text:
-            return f"стоп-фраза «{phrase}»"
-
-    if re.search(r"t\.me/\S+", text):
-        return "ссылка t.me"
-
-    if re.search(r"@[a-z_]{4,}", text):
-        return "упоминание @username"
-
-    # домен без http:// — «bitunix.com», «partner.blofin»
-    if re.search(
-        r"\b[a-z0-9][a-z0-9-]*\.(com|net|org|io|me|co|xyz|app|link|gg|top|vip|pro|site|online|club|finance)\b",
-        text,
-    ):
-        return "домен без http"
-
-    if re.search(r"[🎉🎊🥳]{2,}", raw_text):
-        return "эмодзи-спам"
-
-    if re.search(r"[💰💵💸🤑]{2,}", raw_text):
-        return "денежный эмодзи-спам"
-
-    if re.search(r"\baum\b", text) and (
-        "usdt" in text or "copy" in text or "strategy" in text or "trading" in text
-    ):
-        return "AUM + копитрейд"
-
-    if "username" in text and (
-        "copy" in text or "trading" in text or "blofin" in text or "arki" in text
-    ):
-        return "username + копитрейд"
-
-    return None
+    """Причина, по которой пост режется целиком. None — пост проходит.
+    Правила — общие с ботом 5k-50k (image_filter.py = filters.py там): стоп-лист Arki, продажа
+    мест, призывы к подписчикам (лайки, follow, вступить, оплата, уведомления), бонусы и UID
+    бирж, розыгрыши, спонсоры, ссылки и @username — в том числе замаскированные."""
+    return text_block_reason(raw_text)
 
 
 def should_block_entire_post(raw_text: str) -> bool:
@@ -1703,6 +1597,15 @@ async def user_init(app):
     """Аккаунты подключаем в фоне с паузой USER_START_DELAY — бот при этом уже работает."""
     global APP_BOT
     APP_BOT = app.bot
+    if pings.CONFIG:
+        tagged = [n for n, cid in all_channels.items() if pings.role_for(n, cid)]
+        log(f"🔔 Тег роли (DISCORD_PING): {', '.join(tagged) or 'ни одного канала'}")
+        lost = pings.unmatched(all_channels.items())
+        if lost:
+            log(f"⚠️ DISCORD_PING: нет канала «{', '.join(lost)}» в DISCORD_CHANNELS")
+            asyncio.create_task(_alert(
+                f"⚠️ <b>DISCORD_PING</b>: не нашёл канал «{html.escape(', '.join(lost))}» в DISCORD_CHANNELS — "
+                "там тега не будет. Слева в DISCORD_PING — название канала как в DISCORD_CHANNELS или id канала."))
     asyncio.create_task(_user_init_later())
     if IMAGE_FILTER != "off":
         asyncio.create_task(asyncio.to_thread(_ocr_warmup))
@@ -1938,6 +1841,23 @@ async def _send_webhook_bee(dc_text: str, img_task: Optional[asyncio.Task], repo
 
 post_lock = asyncio.Lock()   # посты — строго по одному и по порядку; команды при этом отвечают
 
+# Тег роли Discord (pings.py, переменная DISCORD_PING): решение — по каждому посту, по порядку
+PINGER = pings.Pinger()
+
+
+def _ping_decide(text: str) -> Optional[str]:
+    """Ставить ли тег на этот пост («вход», «закрытие», …) или None. Сбой правила пересылку не трогает."""
+    if not pings.CONFIG or not text:
+        return None
+    try:
+        kind = PINGER.decide(text)
+    except Exception as e:
+        log(f"⚠️ Тег: сбой правила ({repr(e)}) — пост уходит без тега")
+        return None
+    if kind:
+        log(f"🔔 тег роли: {kind}")
+    return kind
+
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with post_lock:
@@ -1957,9 +1877,15 @@ async def _handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYP
 
     reason = block_reason(raw_text)
     if reason:
-        log(f"🚫 Пост отфильтрован: {reason}")
-        await send_blocked_report(context.bot, raw_text, reason)
-        return
+        # «Long $btc / Stops 61k / 100 likes please ♥️» — сигнал сверху уходит, хвост режется
+        head = cut_ad_tail(raw_text)
+        if not head:
+            log(f"🚫 Пост отфильтрован: {reason}")
+            await send_blocked_report(context.bot, raw_text, reason)
+            return
+        log(f"✂️ Вырезан рекламный хвост ({reason}) — сигнал уходит")
+        await send_blocked_report(context.bot, raw_text, reason, sent=head)
+        raw_text = head
 
     tg_text = transform_for_telegram(raw_text)
     dc_text = transform_for_discord(raw_text) or ""
@@ -1989,6 +1915,7 @@ async def _dispatch(context, tg_text: str, dc_text: str, file_id: Optional[str],
     verdict_task = (asyncio.create_task(_photo_verdict(img_task))
                     if is_photo and not force else None)
     gate = lambda make: (lambda: _if_pass(verdict_task, make))
+    ping = _ping_decide(dc_text)
 
     tasks = []
     if is_photo:
@@ -2001,7 +1928,7 @@ async def _dispatch(context, tg_text: str, dc_text: str, file_id: Optional[str],
         tasks.append(_chain("bee", gate(lambda: _send_webhook_bee(dc_text, img_task, report, bundle))))
         launchers.append(_chain("users", gate(lambda: _launch_users(dc_text, is_photo, img_task, report, bundle))))
         launchers.append(_chain("delayed", gate(lambda: delayed_send(dc_text, img_task, report, bot, file_id,
-                                                                     bundle, arrived))))
+                                                                     bundle, arrived, ping))))
     post = {"tg_text": tg_text, "dc_text": dc_text, "file_id": file_id}
     asyncio.create_task(_report_when_done(bot, report, bundle, tasks, launchers, verdict_task, post))
 

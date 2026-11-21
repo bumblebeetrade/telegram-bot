@@ -12,5 +12,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # чтобы первая карточка в проде не ждала
 RUN python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR()"
 
-COPY main.py image_filter.py ./
+COPY main.py image_filter.py pings.py ./
 CMD ["python", "-u", "main.py"]
