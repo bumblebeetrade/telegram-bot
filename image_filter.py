@@ -168,6 +168,23 @@ FUTURE_REGEX = [
     (r"\bdonat(?:e|ion|ions)\b|\bbuy\s+me\s+a\s+coffee\b|\btip\s+(?:me|jar)\b", "донаты"),
     (r"\b(?:trading|signal|signals|copy|auto)\s+bots?\b", "бот-копитрейдинг"),
 ]
+# Речь о самой группе / канале и набор в следующий челлендж (27.11.2026 прошли: «In less than 12 hours
+# this group will be closed», «The current Running group will be closed soon», «How many of you wants
+# to join another challenge?», «Should I start onboard people for next Challenges?», «❤️ Over 100
+# Reactions») — подписчикам наших каналов это не нужно ни в каком виде.
+META_REGEX = [
+    (r"\b(?:this|the|our|my|current|running|paid|free|private|new|next|old|main|whole)\s+"
+     r"(?:running\s+|paid\s+|private\s+|free\s+|vip\s+)?(?:groups?|channels?|community|communities|chats?|servers?)\b",
+     "речь о группе / канале"),
+    (r"\b(?:groups?|channels?|community)\s+(?:will|is|was|has|gets?|getting|closing|closed|ends?)\b",
+     "речь о группе / канале"),
+    (r"\b(?:next|another|new|upcoming|future)\s+(?:\d+\s*x\s+|\d+\s*\$?\s*-\s*\d+\s*\$?\s+)?challenges?\b",
+     "набор в следующий челлендж"),
+    (r"\bonboard", "набор людей"),
+    (r"\b(?:who|anyone|how\s+many\s+of\s+you)\b.{0,25}\b(?:wants?|wanna|interested|ready)\s+(?:to\s+)?join",
+     "набор людей"),
+    (r"\breactions?\b|\b\d+\s*\+?\s*(?:hearts?|comments?|retweets?|rts?)\b", "просьба реакций"),
+]
 # биржи, которых нет в стоп-листе Arki (не тикеры: ASTER, APEX, DRIFT сюда не попадают)
 MORE_EXCHANGES = ["zoomex", "margex", "primexbt", "btcc", "coinw", "ourbit", "deepcoin", "bydfi",
                   "fameex", "bitvenus", "ascendex", "probit"]
@@ -245,7 +262,7 @@ def text_block_reason(raw_text: str) -> Optional[str]:
     for pattern, why in SALES_REGEX:
         if re.search(pattern, text):
             return why
-    for pattern, why in FUTURE_REGEX:
+    for pattern, why in FUTURE_REGEX + META_REGEX:
         m = re.search(pattern, text)
         if m:
             return f"{why} «{m.group(0).strip()}»"
@@ -303,7 +320,7 @@ def _is_call(line: str) -> bool:
     """Строка — призыв к подписчикам (лайки, follow, оплата… — CALL_REGEX, NOISE_PHRASES, FUTURE_REGEX)."""
     low = normalize_text(line)
     return (any(p in low for p in NOISE_PHRASES)
-            or any(re.search(p, low) for p, _ in CALL_REGEX + FUTURE_REGEX))
+            or any(re.search(p, low) for p, _ in CALL_REGEX + FUTURE_REGEX + META_REGEX))
 
 
 def cut_ad_tail(raw_text: str) -> Optional[str]:

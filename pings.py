@@ -68,12 +68,29 @@ _HEADER = re.compile(r"^.*\bchallenge\b.*$|^\s*trade\s*-?\s*\d+\s*$|^\s*announce
 # стоп сработал — все и так видят
 _SL_HIT = re.compile(r"\b(?:sl|stops?|stop[\s-]*loss)\s*(?:got\s+|was\s+|is\s+)?(?:hit|triggered|taken)\b"
                      r"|\bstopped\s*out\b|\bhit\s+(?:the\s+|my\s+)?(?:sl|stop)\b", re.I)
-# закрытие руками — подписчикам надо закрыть тоже (и в минус: «Closed for -100»)
-_CLOSE = re.compile(r"\bclos(?:e|ed|ing)\b|\bexit(?:ed|ing)?\b|\bbook(?:ed|ing)?\b|\btook\s+profits?\b"
-                    r"|\btp\s*\d?\s*(?:hit|done)\b|\btargets?\s*\d?\s*(?:hit|done|reached)\b"
-                    r"|\bcut\s+(?:the\s+|this\s+)?(?:trade|position|loss)", re.I)
-# убыток: тег — только если у сделки не было стопа (значит, закрыл руками)
-_LOSS = re.compile(r"\blost\b|(?<!stop )(?<!stop-)\bloss\b", re.I)
+# закрытие руками — подписчикам надо закрыть тоже (и в минус: «Closed for -100»). Слово «закрыть» —
+# только про позицию: в первых словах строки («Closed», «BTC long closed», «I m closing EVAA at 2.567»).
+# 27.11 «In less than 12 hours this group will be closed» получил тег — так больше нельзя.
+_CLOSE_WORD = re.compile(r"^(?:clos(?:e|ed|ing)|exit(?:ed|ing)?|book(?:ed|ing)?)$")
+_CLOSE_ANY = re.compile(r"\btook\s+profits?\b|\btp\s*\d?\s*(?:hit|done)\b|\btargets?\s*\d?\s*(?:hit|done|reached)\b"
+                        r"|\bcut\s+(?:the\s+|this\s+)?(?:trade|position|loss)", re.I)
+# убыток: тег — только если у сделки не было стопа (значит, закрыл руками). Тоже только в начале строки
+# («Lost», «Lost pieverse-89», «Loss day today», «83 lost»): «The loss will be covered» — не убыток.
+_LOSS_LINE = re.compile(r"^\s*(?:lost|loss)\b|^\s*-?\s*\$?\d[\d.,]*\s*\$?\s+lost\b"
+                        r"|^\s*\$?[a-z][a-z0-9]{1,14}\s+lost\b", re.I | re.M)   # «Aster lost -74»
+# речь о группе, канале, челлендже, реакциях — не действие по сделке, тега нет никогда
+_META = re.compile(r"\b(?:groups?|channels?|community|chats?|servers?|challenges?|reactions?|likes?|join(?:ing)?"
+                   r"|pinned|fees?|subscribers?|members?|onboard\w*)\b", re.I)
+
+
+def _close_like(t: str) -> bool:
+    if _CLOSE_ANY.search(t):
+        return True
+    for line in t.lower().splitlines():
+        words = re.findall(r"[a-z0-9$#@.'-]+", line)
+        if any(_CLOSE_WORD.match(w) for w in words[:4]):
+            return True
+    return False
 _LOSS_NUM = re.compile(r"^\s*-\s*\d+(?:[.,]\d+)?\s*\$?\s*\S{0,3}\s*$")          # «-100», «-100 😔», «-19$»
 # новая позиция («how long», «long term» — не сделка)
 _OPEN = re.compile(r"(?<!how )(?<!as )(?<!so )\b(?:re[\s-]?)?(?:long(?:ed|ing)?|short(?:ed|ing)?)\b"
@@ -139,11 +156,11 @@ def classify(text: str) -> str | None:
         return "убыток" if _LOSS_NUM.match(t) else None  # «-100» — убыток; «+52», «322» — итог
     if _SL_HIT.search(t):
         return "стоп сработал"
-    if len(t) > MAX_LEN:
-        return None                                      # длинный текст — разговор, а не действие
-    if _CLOSE.search(t):
+    if len(t) > MAX_LEN or _META.search(t):
+        return None                                      # длинный текст, речь о группе — не действие
+    if _close_like(t):
         return "закрытие"
-    if _LOSS.search(t):
+    if _LOSS_LINE.search(t):
         return "убыток"
     if _NOT_TRADE.search(t):
         return None                                      # вопросы, советы, разговор
