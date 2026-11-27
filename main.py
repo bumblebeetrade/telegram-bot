@@ -2,8 +2,8 @@
 Telegram → Discord Bridge
 
 Источники: SOURCE_CHANNEL и (необязательно) SOURCE_CHANNEL_2 — два челленджа трейдера сразу
-(старый доводит сделки, новый уже идёт). Посты обоих уходят во все таргеты; у webhook Bee для
-второго может быть свой канал Discord (DISCORD_WEBHOOK_URL_SOURCE_2).
+(старый доводит сделки, новый уже идёт). Посты обоих уходят во все таргеты, кроме своих каналов
+нового челленджа: webhook Bee (DISCORD_WEBHOOK_URL_SOURCE_2) и TG #3 при TARGET_SOURCE_3=2.
 
 Языки таргетов:
   RU  — только TG #1 (Crypto Phoenix)
@@ -87,6 +87,9 @@ TARGET_MESSAGE_THREAD_ID_2 = int(os.getenv("TARGET_MESSAGE_THREAD_ID_2", "0") or
 TARGET_CHAT_ID_3           = int(os.getenv("TARGET_CHAT_ID_3", "0") or "0")
 TARGET_MESSAGE_THREAD_ID_3 = int(os.getenv("TARGET_MESSAGE_THREAD_ID_3", "0") or "0")
 TARGET_LABEL_3             = os.getenv("TARGET_LABEL_3", "").strip() or "TG #3"
+# Из какого источника TG #3 берёт посты: 2 — только SOURCE_CHANNEL_2 (канал нового челленджа, как его
+# webhook Bee), 1 — только SOURCE_CHANNEL, пусто — из всех
+TARGET_SOURCE_3            = os.getenv("TARGET_SOURCE_3", "").strip()
 
 # ── Таргеты от лица моего аккаунта (Telethon) ────────────────────────────────
 TG_API_ID                  = int(os.getenv("TG_API_ID", "0") or "0")
@@ -195,11 +198,15 @@ bridge_enabled: bool          = True
 def _sources() -> dict:
     """Каналы-источники: id → подпись для сводок, webhook Bee и своя память сделок для тега роли
     (у двух челленджей свои сделки: «Lost» в одном не должен закрывать сделку другого)."""
+    if TARGET_SOURCE_3 not in ("", "1", "2"):
+        print(f"⚠️ TARGET_SOURCE_3={TARGET_SOURCE_3!r} — непонятно (нужно 1, 2 или пусто); TG #3 получает всё", flush=True)
+    tg3_from = TARGET_SOURCE_3 if TARGET_SOURCE_3 in ("1", "2") else ""
     res = {SOURCE_CHANNEL: {"id": SOURCE_CHANNEL, "label": SOURCE_LABEL, "bee": DISCORD_WEBHOOK_URL,
-                            "bee_label": "Bee", "bee_chain": "bee", "pinger": pings.Pinger()}}
+                            "bee_label": "Bee", "bee_chain": "bee", "pinger": pings.Pinger(),
+                            "tg3": tg3_from in ("", "1")}}
     if SOURCE_CHANNEL_2 and SOURCE_CHANNEL_2 != SOURCE_CHANNEL:
         res[SOURCE_CHANNEL_2] = {
-            "id": SOURCE_CHANNEL_2, "label": SOURCE_LABEL_2,
+            "id": SOURCE_CHANNEL_2, "label": SOURCE_LABEL_2, "tg3": tg3_from in ("", "2"),
             # у нового челленджа — только свой webhook (свой канал Discord) и своя очередь; пока его нет,
             # в webhook Bee посты второго источника не идут (в старый канал Discord не попадают)
             "bee": DISCORD_WEBHOOK_URL_SOURCE_2,
@@ -210,6 +217,12 @@ def _sources() -> dict:
 
 
 SOURCES: dict = _sources()
+
+
+def _tg3_from() -> str:
+    """Откуда TG #3 получает посты — для лога запуска и /checkchats."""
+    mine = [s["label"] or str(cid) for cid, s in SOURCES.items() if s["tg3"]]
+    return "посты: все источники" if len(mine) == len(SOURCES) else "посты: только " + ", ".join(mine)
 
 
 def _src_tag(src: Optional[dict]) -> str:
@@ -891,7 +904,7 @@ async def cmd_checkchats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             can = can or (chat.type != "channel" and me.status == "member")
             results.append(f"{'✅' if can else '❌'} {name}: <code>{TARGET_CHAT_ID_3}</code>"
                            f"{f' (thread {TARGET_MESSAGE_THREAD_ID_3})' if TARGET_MESSAGE_THREAD_ID_3 else ''}"
-                           f" — {html.escape(chat.title or '?')}"
+                           f" — {html.escape(chat.title or '?')} · {html.escape(_tg3_from())}"
                            + ("" if can else " — у бота нет права публиковать (сделайте админом)"))
         except Exception as e:
             results.append(f"❌ {name}: <code>{TARGET_CHAT_ID_3}</code> — {html.escape(repr(e))}")
@@ -1984,7 +1997,8 @@ async def _dispatch(context, tg_text: str, dc_text: str, file_id: Optional[str],
     launchers = []
     if is_photo or dc_text:
         tasks.append(_chain("heaven", gate(lambda: _send_heaven(context, is_photo, dc_text, img_task, report, bundle))))
-        tasks.append(_chain("tg3", gate(lambda: _send_tg3(context, is_photo, file_id, dc_text, report, bundle))))
+        if src["tg3"]:      # TG #3 — только посты своего челленджа (TARGET_SOURCE_3)
+            tasks.append(_chain("tg3", gate(lambda: _send_tg3(context, is_photo, file_id, dc_text, report, bundle))))
         tasks.append(_chain(src["bee_chain"], gate(lambda: _send_webhook_bee(dc_text, img_task, report, bundle, src))))
         launchers.append(_chain("users", gate(lambda: _launch_users(dc_text, is_photo, img_task, report, bundle))))
         launchers.append(_chain("delayed", gate(lambda: delayed_send(dc_text, img_task, report, bot, file_id,
@@ -2065,7 +2079,7 @@ def main():
         print(f"📥 Источник{_src_tag(src) or ''}: {cid} · webhook {src['bee_label']}"
               f"{'' if src['bee'] else ' — не задан'}", flush=True)
     if TARGET_CHAT_ID_3:
-        print(f"📤 {TARGET_LABEL_3}: {TARGET_CHAT_ID_3} (EN, основной бот)", flush=True)
+        print(f"📤 {TARGET_LABEL_3}: {TARGET_CHAT_ID_3} (EN, основной бот) · {_tg3_from()}", flush=True)
     # явно: my_chat_member («меня добавили в канал») Telegram по умолчанию может не присылать
     app.run_polling(drop_pending_updates=True,
                     allowed_updates=["message", "channel_post", "callback_query", "my_chat_member"])

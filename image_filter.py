@@ -121,7 +121,9 @@ CALL_REGEX = [
     (r"\bvip\b", "VIP"),
     (r"\bfree\s+(?:group|channel|signals?|trial|access|vip|entry|telegram|tg)\b", "бесплатная группа / доступ"),
     (r"\bdm\s+(?:me|us|for|to|now)\b|\binbox\b", "личка (dm)"),
-    (r"\blink\s+(?:below|in\s+(?:comments?|description|pinned|bio))\b|\bcheck\s+(?:the\s+)?pinned\b|\bpinned\s+post\b",
+    # «Details in Pinned comment» (28.11, канал 250-1000) — отсылка к закрепу, где реклама/условия
+    (r"\blink\s+(?:below|in\s+(?:comments?|description|pinned|bio))\b|\bcheck\s+(?:the\s+)?pinned\b"
+     r"|\bpinned\s+(?:posts?|comments?|messages?|msgs?)\b|\b(?:in|on|at)\s+(?:the\s+|my\s+|our\s+)?pinned\b",
      "ссылка «ниже» / в закрепе"),
     (r"\b(?:my|our|this)\s+link\b|\buse\s+(?:my|our)\b", "своя ссылка / код"),
     (r"(?:\$\s*\d+|\d+\s*\$)\s*(?:/|per|a)\s*(?:month|week|year|mo|lifetime)\b|\b(?:monthly|weekly|yearly)\s+"
