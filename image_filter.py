@@ -185,6 +185,38 @@ META_REGEX = [
      "набор людей"),
     (r"\breactions?\b|\b\d+\s*\+?\s*(?:hearts?|comments?|retweets?|rts?)\b", "просьба реакций"),
 ]
+# Ещё на шаг вперёд (27.11.2026, по просьбе пользователя «предвидеть»): чем обычно торгуют каналы с
+# сигналами, когда челлендж кончается, — обучение, управление чужими деньгами, оплата по-индийски (UPI),
+# стримы, «доказательства» и отзывы, раздачи токенов, пампы, прощания, «последнее предложение».
+# Каждое правило — фразой, а не голым словом: «of course», «only 5$ loss», «Apologies, wrong entry»,
+# «BTC taking a break», «this setup offers good RR», «next 100x gem», «proof of my trade» — обычная речь
+# трейдера, такие посты не режутся (проверено отдельным списком, см. HISTORY 27.11).
+AHEAD_REGEX = [
+    (r"(?<!of )\b(?:(?:trading|crypto|my|our|paid|full|online)\s+courses?|coaching|mentorship|tutorials?|e-?books?"
+     r"|pdf\s+guide|trading\s+class\w*|teach\s+you|learn\s+(?:to\s+)?trad\w*|1\s*:\s*1\s+(?:session|call)s?"
+     r"|one[\s-]on[\s-]one\s+(?:session|call|coaching|mentorship)s?)\b", "обучение / курсы"),
+    (r"\b(?:fund|funds|account|portfolio|capital)\s+(?:management|manager|handling)\b|\bmanag\w*\s+(?:your|ur|client)\s+"
+     r"(?:funds?|capital|money|accounts?)\b|\bsend\s+(?:me\s+)?your\s+(?:funds?|money|capital)\b|\binvestment\s+plans?\b"
+     r"|\bpassive\s+income\b|\b\d+\s*%\s*(?:daily|weekly|monthly)\s+(?:returns?|profits?|roi|income)\b",
+     "управление чужими деньгами"),
+    (r"\b(?:upi|paytm|phonepe|gpay|google\s+pay|paypal|bank\s+transfer|ifsc|account\s+number|invoice)\b", "оплата"),
+    (r"\b(?:last|special|limited|exclusive|today'?s|discount|festive|launch|joining)\s+offers?\b|\boffers?\s+(?:ends?|valid|price)\b"
+     r"|\bearly\s+bird\b|\b(?:for|at)\s+(?:just|only)\s+\d+\s*\$|\bprice\s+will\s+increase\b", "предложение / цена"),
+    (r"\blive\s*stream\w*|\bgoing\s+live\b|\b(?:x|twitter)\s+spaces?\b|\bama\b|\bpodcast\b|\b(?:new|my|latest)\s+(?:video|reel|stream)\b"
+     r"|\bwatch\s+(?:my|the\s+full|full)\s+(?:video|stream)\b", "стрим / видео"),
+    (r"\b(?:hit\s+me\s+up|ping\s+me|dms?\s+(?:are\s+)?open|inbox\s+open|contact\s+(?:on|at|via)|message\s+(?:on|at)\s+"
+     r"(?:tg|telegram|whatsapp|insta\w*))\b", "личка"),
+    (r"\btestimonials?\b|\b(?:payment|members?|students?|clients?)\s+proofs?\b|\bproofs?\s+of\s+(?:payment|members?|students?"
+     r"|clients?|profits?\s+of)\b|\b\d+\s*%\s*(?:win\s*rate|accuracy|success\s+rate)\b"
+     r"|\b(?:members?|students?|clients?)\s*'?s?\s+(?:profits?|pnl|results?|gains?)\b", "реклама результатов"),
+    (r"\bconnect\s+(?:your\s+)?wallets?\b|\bfree\s+(?:tokens?|coins?|money|crypto)\b|\bmint\s+(?:now|is\s+live|live)\b"
+     r"|\bpump\s+(?:group|signals?|channel)\b", "раздача / памп"),
+    (r"\b(?:good\s*bye|farewell|good\s+life\s+ahead|signing\s+off|(?:i\s*'?\s*a?m|i\s+will\s+be|we\s+are)\s+taking\s+a\s+break"
+     r"|i\s*'?\s*a?m\s+on\s+(?:a\s+)?(?:vacation|holiday)|last\s+(?:message|post)\s+(?:here|in\s+this))\b", "прощание"),
+    (r"\btag\s+\d+\s+friends?\b|\b(?:auto[\s-]?follow|smart\s+copy|lead\s+trader|portfolio\s+link)\b", "призыв"),
+    # адрес кошелька или контракта Solana (base58, 32–44 знака, цифры и буквы вперемешку)
+    (r"\b(?=[a-z0-9]{32,44}\b)(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{32,44}\b", "адрес кошелька / контракта"),
+]
 # биржи, которых нет в стоп-листе Arki (не тикеры: ASTER, APEX, DRIFT сюда не попадают)
 MORE_EXCHANGES = ["zoomex", "margex", "primexbt", "btcc", "coinw", "ourbit", "deepcoin", "bydfi",
                   "fameex", "bitvenus", "ascendex", "probit"]
@@ -205,6 +237,8 @@ def normalize_text(raw_text: str) -> str:
     text = unicodedata.normalize("NFKC", html.unescape(raw_text or ""))
     text = _ZERO_WIDTH.sub("", text).lower().translate(_LOOKALIKE)
     text = re.sub(r"\bhxxp", "http", _FAKE_DOT.sub(".", text))
+    # «j o i n», «t.e.l.e.g.r.a.m», «j-o-i-n» — буквы через пробел, точку или дефис склеиваем
+    text = re.sub(r"\b(?:[a-z][ .\-_*]){2,}[a-z]\b", lambda m: re.sub(r"[ .\-_*]", "", m.group(0)), text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -262,7 +296,7 @@ def text_block_reason(raw_text: str) -> Optional[str]:
     for pattern, why in SALES_REGEX:
         if re.search(pattern, text):
             return why
-    for pattern, why in FUTURE_REGEX + META_REGEX:
+    for pattern, why in FUTURE_REGEX + META_REGEX + AHEAD_REGEX:
         m = re.search(pattern, text)
         if m:
             return f"{why} «{m.group(0).strip()}»"
@@ -320,7 +354,7 @@ def _is_call(line: str) -> bool:
     """Строка — призыв к подписчикам (лайки, follow, оплата… — CALL_REGEX, NOISE_PHRASES, FUTURE_REGEX)."""
     low = normalize_text(line)
     return (any(p in low for p in NOISE_PHRASES)
-            or any(re.search(p, low) for p, _ in CALL_REGEX + FUTURE_REGEX + META_REGEX))
+            or any(re.search(p, low) for p, _ in CALL_REGEX + FUTURE_REGEX + META_REGEX + AHEAD_REGEX))
 
 
 def cut_ad_tail(raw_text: str) -> Optional[str]:
@@ -384,6 +418,7 @@ CARD_KEYWORDS = [
     "entry", "margin", "liq", "markprice", "mark price", "pnl", "roi",
     "qty", "size", "amount", "orderprice", "order price", "filled",
     "totalvalue", "total value", "balance", "equity",
+    "futuresvalue", "futures value", "totalassets", "total assets",   # скрин счёта Bitunix «Futures Value (USDT)»
 ]
 
 
@@ -417,6 +452,14 @@ FUTURE_IMAGE_RE = [
     (r"(?<![a-z])subscribe|(?<![a-z])follow\s?(?:us|me|for)|retweet|comment\s?below|like\s?(?:and|&)\s?share",
      "призыв подписаться"),
     (r"(?<![a-z])kyc(?![a-z])|telegram", "реклама (KYC / Telegram)"),
+    # 27.11: оплата по QR/UPI, скрины оплаты, соцсети и мессенджеры, отзывы
+    (r"(?<![a-z])(?:upi|paytm|phonepe|gpay)(?![a-z])|google\s?pay|scan\s?(?:to|&)\s?pay|payment\s?(?:successful|done|received)"
+     r"|paid\s?to(?![a-z])", "скрин оплаты / реквизиты"),
+    (r"youtube|instagram|tiktok|whatsapp|last\s?seen|typing\.\.\.", "скрин соцсети / мессенджера"),
+    (r"testimonial|win\s?rate", "реклама результатов"),
+    # рекламный макет биржи: на промо-картинках iPhone всегда показывает 9:41, внизу — значки партнёров
+    # (баннер BloFin «Where whales are made» в канале — экран BTCUSDT с «Last Price» и QR)
+    (r"(?<![\d:.])9:41(?![\d:])|fireblocks|chainalysis|where\s?whales", "рекламный баннер биржи"),
 ]
 # Скрины других соцсетей — каждый признак проверен на 922 обычных картинках истории: 0 срабатываний
 SOCIAL_RE = [
@@ -524,3 +567,52 @@ def image_verdict(ocr_lines: list[str], qr: str = "") -> tuple[bool, str]:
     if not joined.strip():
         return True, "картинка без текста"
     return True, "картинка без промо-признаков"
+
+
+# ── Строгая проверка картинки (была только в мосте Arki; с 27.11 — у обоих ботов) ──
+# Дальше уходят только карточки сделок/ордеров, балансы, графики и сигнал, написанный на картинке.
+# Остальное (мем, фото, чужой скрин без рекламных слов, картинка без текста) — админу на проверку
+# с кнопкой «Всё равно переслать»: вслепую не шлём.
+
+# график: пара TradingView («Bitcoin / TetherUS», «… / U.S. Dollar») или экран сделки на бирже
+# («Last Price», «24h High», «Funding Rate») — в истории канала это всегда сетап сделки
+CHART_RE = re.compile(r"/\s*(?:u\.?s\.?\s*dollar|tetherus)|24h\s*(?:high|low)|last\s*price|funding\s*rate"
+                      # подпись TradingView «BTCUSDT.P · 1h · BINANCE», «ETHUSDT SPOT · 1D · Bybit»
+                      r"|[a-z0-9]{2,12}usdt(?:\.p|\s?spot|\s?perp)?\s*[·•|.,\-]?\s*\d{1,3}\s?[mhdw](?![a-z])"
+                      # строка свечи TradingView «O2,687.88 H2,743.21 L2,667.04 C2,742.05»
+                      r"|(?<![a-z])o\s?[\d,.]{3,}\s*h\s?[\d,.]{3,}\s*l\s?[\d,.]{3,}\s*c\s?[\d,.]{3,}")
+# оси графика без подписей (тепловая карта ликвидаций и т. п.): цены по оси и метки времени
+AXIS_PRICE_RE = re.compile(r"(?<![\d.,])\d{1,3}(?:,\d{3})+(?:\.\d+)?(?![\d,])|(?<![\d.,])\d{4,6}(?:\.\d+)?(?![\d,])")
+AXIS_TIME_RE = re.compile(r"\d{2}-\d{2}\s?\d{1,2}:\d{2}|(?<!\d)\d{1,2}:\d{2}(?!\d)")
+# сигнал, написанный на картинке: направление и уровни («Long BTC / Entry 64k / SL 62k»)
+SIGNAL_SIDE_RE = re.compile(r"(?<![a-z])(?:long|short|longed|shorted)(?![a-z])")
+SIGNAL_LEVEL_RE = re.compile(r"(?<![a-z])(?:entry|entries|sl|stop|stops|tp|take\s*profit|dca|target)(?![a-z])")
+
+
+def card_like(low: str) -> bool:
+    """Карточка позиции/ордера: пара …USDT и поля сделки."""
+    compact = low.replace(" ", "")
+    hits = sum(1 for k in CARD_KEYWORDS if k.replace(" ", "") in compact)
+    return bool(re.search(r"[a-z0-9]{2,12}usdt", compact)) and hits >= 2
+
+
+def image_decision(ocr_lines: list[str], qr: str = "", strict: bool = True) -> tuple[str, str]:
+    """(решение, пояснение): pass — уходит; block — реклама / чужой скрин; review — не похоже на
+    карточку или график: решает админ. strict=False — уходит всё, где нет рекламы (режим «ads»)."""
+    ok, why = image_verdict(ocr_lines, qr)
+    low = " ".join(ocr_lines).lower()
+    if not ok:
+        # единственная причина — название биржи, а на картинке карточка сделки или график
+        # («Bitget Futures» в шапке карточки, «BTCUSDT.P · 1h · BINANCE» на TradingView) — это сигнал
+        if re.fullmatch(r"бренд биржи «[^»]+»", why) and (card_like(low) or CHART_RE.search(low)):
+            return "pass", f"карточка / график с названием биржи ({why})"
+        return "block", why
+    if strict and why not in ("карточка позиции / ордера", "скрин баланса / счёта"):
+        if why == "картинка без промо-признаков":
+            prices, times = len(AXIS_PRICE_RE.findall(low)), len(AXIS_TIME_RE.findall(low))
+            if CHART_RE.search(low) or (prices >= 5 and times >= 1) or prices >= 8:
+                return "pass", "график / экран сделки"
+            if SIGNAL_SIDE_RE.search(low) and SIGNAL_LEVEL_RE.search(low):
+                return "pass", "сигнал на картинке (направление и уровни)"
+        return "review", f"не похоже на карточку сделки ({why})"
+    return "pass", why

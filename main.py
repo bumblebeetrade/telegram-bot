@@ -1,9 +1,13 @@
 """
 Telegram → Discord Bridge
 
+Источники: SOURCE_CHANNEL и (необязательно) SOURCE_CHANNEL_2 — два челленджа трейдера сразу
+(старый доводит сделки, новый уже идёт). Посты обоих уходят во все таргеты; у webhook Bee для
+второго может быть свой канал Discord (DISCORD_WEBHOOK_URL_SOURCE_2).
+
 Языки таргетов:
   RU  — только TG #1 (Crypto Phoenix)
-  EN  — все остальные: TG #2 (Heaven), TG #3 (мой аккаунт),
+  EN  — все остальные: TG #2 (Heaven), TG #3 (канал, основной бот), аккаунты,
         Discord webhook Bee, Rebel Angels, selfbot каналы
 
 Selfbot через 10 сек от прихода поста → каналы с паузами 5-7 сек →
@@ -51,6 +55,7 @@ from telegram.ext import (
     MessageHandler,
     CommandHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters,
 )
@@ -59,19 +64,29 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 # фильтр текста и картинок — общий файл с ботом 5k-50k (там он filters.py)
-from image_filter import CARD_KEYWORDS, cut_ad_tail, image_verdict, qr_text, text_block_reason
+from image_filter import cut_ad_tail, image_decision, qr_text, text_block_reason
 import pings                     # тег роли Discord на важные действия трейдера (DISCORD_PING) — как у 5k-50k
 
 BOT_TOKEN                  = os.getenv("BOT_TOKEN")
 BOT_TOKEN_2                = os.getenv("BOT_TOKEN_2", "")  # Heaven — для TG #2
 
 SOURCE_CHANNEL             = int(os.getenv("SOURCE_CHANNEL", "0"))
+# Второй канал-источник: новый челлендж, пока в старом трейдер доводит сделки. Пусто — один источник.
+SOURCE_CHANNEL_2           = int(os.getenv("SOURCE_CHANNEL_2", "0") or "0")
+# подписи источников в сводках админу (например 250-1000 / 250-2500); в таргеты не уходят
+SOURCE_LABEL               = os.getenv("SOURCE_LABEL", "").strip()
+SOURCE_LABEL_2             = os.getenv("SOURCE_LABEL_2", "").strip()
 
 TARGET_CHAT_ID             = int(os.getenv("TARGET_CHAT_ID", "0"))
 TARGET_MESSAGE_THREAD_ID   = int(os.getenv("TARGET_MESSAGE_THREAD_ID", "0") or "0")
 
 TARGET_CHAT_ID_2           = int(os.getenv("TARGET_CHAT_ID_2", "0"))
 TARGET_MESSAGE_THREAD_ID_2 = int(os.getenv("TARGET_MESSAGE_THREAD_ID_2", "0") or "0")
+
+# TG #3 — канал или группа на английском (без перевода), шлёт основной бот (BOT_TOKEN)
+TARGET_CHAT_ID_3           = int(os.getenv("TARGET_CHAT_ID_3", "0") or "0")
+TARGET_MESSAGE_THREAD_ID_3 = int(os.getenv("TARGET_MESSAGE_THREAD_ID_3", "0") or "0")
+TARGET_LABEL_3             = os.getenv("TARGET_LABEL_3", "").strip() or "TG #3"
 
 # ── Таргеты от лица моего аккаунта (Telethon) ────────────────────────────────
 TG_API_ID                  = int(os.getenv("TG_API_ID", "0") or "0")
@@ -95,6 +110,9 @@ USER_LABEL_2               = os.getenv("USER_LABEL_2", "Ivan")
 
 DISCORD_WEBHOOK_URL        = os.getenv("DISCORD_WEBHOOK_URL", "")
 DISCORD_WEBHOOK_URL_2      = os.getenv("DISCORD_WEBHOOK_URL_2", "")
+# webhook Bee для постов из SOURCE_CHANNEL_2 (свой канал Discord у нового челленджа);
+# пусто — посты второго источника в webhook Bee не идут (в старый канал Discord не попадают)
+DISCORD_WEBHOOK_URL_SOURCE_2 = os.getenv("DISCORD_WEBHOOK_URL_SOURCE_2", "")
 DEBUG                      = os.getenv("DEBUG", "true").lower() == "true"
 DISCORD_TOKEN              = os.getenv("DISCORD_TOKEN", "")
 
@@ -173,6 +191,31 @@ all_channels: dict[str, str] = _parse_channels_env()
 active_channels: set[str]    = set(all_channels.keys())
 bridge_enabled: bool          = True
 
+
+def _sources() -> dict:
+    """Каналы-источники: id → подпись для сводок, webhook Bee и своя память сделок для тега роли
+    (у двух челленджей свои сделки: «Lost» в одном не должен закрывать сделку другого)."""
+    res = {SOURCE_CHANNEL: {"id": SOURCE_CHANNEL, "label": SOURCE_LABEL, "bee": DISCORD_WEBHOOK_URL,
+                            "bee_label": "Bee", "bee_chain": "bee", "pinger": pings.Pinger()}}
+    if SOURCE_CHANNEL_2 and SOURCE_CHANNEL_2 != SOURCE_CHANNEL:
+        res[SOURCE_CHANNEL_2] = {
+            "id": SOURCE_CHANNEL_2, "label": SOURCE_LABEL_2,
+            # у нового челленджа — только свой webhook (свой канал Discord) и своя очередь; пока его нет,
+            # в webhook Bee посты второго источника не идут (в старый канал Discord не попадают)
+            "bee": DISCORD_WEBHOOK_URL_SOURCE_2,
+            "bee_label": f"Bee {SOURCE_LABEL_2 or '#2'}",
+            "bee_chain": "bee2",
+            "pinger": pings.Pinger()}
+    return res
+
+
+SOURCES: dict = _sources()
+
+
+def _src_tag(src: Optional[dict]) -> str:
+    """« · 250-2500» — какой челлендж, для сводок админу (если источников два)."""
+    return f" · {src['label']}" if src and src["label"] and len(SOURCES) > 1 else ""
+
 # Все подключённые Telethon-аккаунты:
 # [{"name": "BumbleBee", "client": ..., "targets": [(entity, topic_id, label), ...]}, ...]
 user_accounts: list = []
@@ -234,10 +277,11 @@ def _hm() -> str:
 class Report:
     """Копит результаты по всем таргетам и рендерит одно сообщение в конце."""
 
-    def __init__(self, preview: str = ""):
+    def __init__(self, preview: str = "", tag: str = ""):
         self.sections: dict[str, list[tuple[str, bool, str, str]]] = {}
         self.order: list[str] = []
         self.preview = preview
+        self.tag = tag                  # « · 250-2500» — из какого челленджа пост
         self.started = _now()
 
     def add(self, section: str, label: str, ok: bool, note: str = ""):
@@ -251,7 +295,7 @@ class Report:
         good  = sum(1 for v in self.sections.values() for _, ok, _, _ in v if ok)
 
         icon = REPORT_ICON if good == total else "⚠️"
-        head = f"{icon} <b>{html.escape(REPORT_TITLE)}</b> — доставлено {good}/{total}"
+        head = f"{icon} <b>{html.escape(REPORT_TITLE)}</b>{html.escape(self.tag)} — доставлено {good}/{total}"
 
         lines = [head]
         if self.preview:
@@ -311,16 +355,16 @@ def _delay_text() -> str:
             f"между каналами {_sec(SEND_DELAY_MIN, SEND_DELAY_MAX)} сек")
 
 
-async def send_blocked_report(bot: Bot, raw_text: str, reason: str, sent: str = ""):
+async def send_blocked_report(bot: Bot, raw_text: str, reason: str, sent: str = "", tag: str = ""):
     """Уведомление о посте, который срезали фильтры. sent — сигнал без рекламного хвоста,
-    который всё-таки ушёл (хвост вырезан)."""
+    который всё-таки ушёл (хвост вырезан). tag — « · 250-2500», из какого челленджа."""
     if not REPORT_ENABLED or not REPORT_BLOCKED:
         return
     flat = lambda s: " / ".join(line.strip() for line in s.splitlines() if line.strip())[:200]
     preview = flat(raw_text) or "(без текста)"
     head = "✂️ <b>Вырезан рекламный хвост — сигнал ушёл</b>" if sent else "🚫 <b>Пост отфильтрован</b>"
     text = (
-        f"{head} · {_hm()}\n"
+        f"{head}{html.escape(tag)} · {_hm()}\n"
         f"<i>{html.escape(preview)}</i>\n\n"
         f"Причина: <code>{html.escape(reason)}</code>"
         + (f"\nУшло: <i>{html.escape(flat(sent))}</i>" if sent else "")
@@ -478,28 +522,6 @@ async def download_photo(bot: Bot, file_id: str, attempts: int = 0) -> Optional[
 
 _ocr = None
 _ocr_lock = threading.Lock()          # один OCR за раз
-# график: пара TradingView («Bitcoin / TetherUS», «… / U.S. Dollar») или экран сделки на бирже
-# («Last Price», «24h High», «Funding Rate») — в истории канала это всегда сетап сделки
-CHART_RE = re.compile(r"/\s*(?:u\.?s\.?\s*dollar|tetherus)|24h\s*(?:high|low)|last\s*price|funding\s*rate"
-                      # подпись TradingView «BTCUSDT.P · 1h · BINANCE», «ETHUSDT SPOT · 1D · Bybit»
-                      r"|[a-z0-9]{2,12}usdt(?:\.p|\s?spot|\s?perp)?\s*[·•|.,\-]?\s*\d{1,3}\s?[mhdw](?![a-z])"
-                      # строка свечи TradingView «O2,687.88 H2,743.21 L2,667.04 C2,742.05»
-                      r"|(?<![a-z])o\s?[\d,.]{3,}\s*h\s?[\d,.]{3,}\s*l\s?[\d,.]{3,}\s*c\s?[\d,.]{3,}")
-# оси графика без подписей (тепловая карта ликвидаций и т. п.): цены по оси и метки времени
-AXIS_PRICE_RE = re.compile(r"(?<![\d.,])\d{1,3}(?:,\d{3})+(?:\.\d+)?(?![\d,])|(?<![\d.,])\d{4,6}(?:\.\d+)?(?![\d,])")
-AXIS_TIME_RE = re.compile(r"\d{2}-\d{2}\s?\d{1,2}:\d{2}|(?<!\d)\d{1,2}:\d{2}(?!\d)")
-# сигнал, написанный на картинке: направление и уровни («Long BTC / Entry 64k / SL 62k»)
-SIGNAL_SIDE_RE = re.compile(r"(?<![a-z])(?:long|short|longed|shorted)(?![a-z])")
-SIGNAL_LEVEL_RE = re.compile(r"(?<![a-z])(?:entry|entries|sl|stop|stops|tp|take\s*profit|dca|target)(?![a-z])")
-
-
-def _card_like(low: str) -> bool:
-    """Карточка позиции/ордера — та же примета, что в image_filter (пара …USDT и поля сделки)."""
-    compact = low.replace(" ", "")
-    hits = sum(1 for k in CARD_KEYWORDS if k.replace(" ", "") in compact)
-    return bool(re.search(r"[a-z0-9]{2,12}usdt", compact)) and hits >= 2
-
-
 def _ocr_load():
     global _ocr
     if _ocr is None:
@@ -537,25 +559,12 @@ async def check_image(data: bytes) -> tuple:
         log(f"⚠️ OCR ошибка: {repr(e)}")
         return "review", "картинку не удалось проверить (OCR)"
     qr = await asyncio.to_thread(qr_text, data)
-    ok, why = image_verdict(lines, qr)
-    log(f"🔤 {' | '.join(lines)[:160]!r}{' + QR' if qr else ''} → {'✅' if ok else '⛔'} {why} "
-        f"({time.time() - t0:.1f} с)")
-    low = " ".join(lines).lower()
-    if not ok:
-        # единственная причина — название биржи, а на картинке карточка сделки или график
-        # («Bitget Futures» в шапке карточки, «BTCUSDT.P · 1h · BINANCE» на TradingView) — это сигнал
-        if re.fullmatch(r"бренд биржи «[^»]+»", why) and (_card_like(low) or CHART_RE.search(low)):
-            return "pass", f"карточка / график с названием биржи ({why})"
-        return "block", why
-    if IMAGE_FILTER == "strict" and why not in ("карточка позиции / ордера", "скрин баланса / счёта"):
-        if why == "картинка без промо-признаков":
-            # график с позицией (TradingView, экран сделки на бирже) — тоже сигнал
-            if CHART_RE.search(low) or (len(AXIS_PRICE_RE.findall(low)) >= 5 and len(AXIS_TIME_RE.findall(low)) >= 2):
-                return "pass", "график / экран сделки"
-            if SIGNAL_SIDE_RE.search(low) and SIGNAL_LEVEL_RE.search(low):
-                return "pass", "сигнал на картинке (направление и уровни)"
-        return "review", f"не похоже на карточку сделки ({why})"
-    return "pass", why
+    # решение — общее с ботом 5k-50k (image_filter.image_decision): strict — только карточки, балансы,
+    # графики и сигнал на картинке; ads — всё, где нет рекламы
+    status, why = image_decision(lines, qr, strict=IMAGE_FILTER == "strict")
+    log(f"🔤 {' | '.join(lines)[:160]!r}{' + QR' if qr else ''} → "
+        f"{ {'pass': '✅', 'block': '⛔', 'review': '✋'}[status] } {why} ({time.time() - t0:.1f} с)")
+    return status, why
 
 
 async def _photo_verdict(img_task: asyncio.Task) -> tuple:
@@ -587,7 +596,8 @@ async def _report_held(bot: Bot, status: str, why: str, post: dict):
     held_posts.append(post)
     head = ("⛔ <b>Не переслано — картинка</b>" if status == "block" else
             "✋ <b>Нужна ваша проверка — картинка</b>")
-    caption = (f"{head} · {_hm()}\n{html.escape(why)}\n\n"
+    tag = html.escape(_src_tag(SOURCES.get(post.get("src"))))
+    caption = (f"{head}{tag} · {_hm()}\n{html.escape(why)}\n\n"
                f"<i>{html.escape((post['dc_text'] or post['tg_text'] or '(без текста)')[:600])}</i>")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Всё равно переслать", callback_data=f"hforce:{_held_seq}"),
                                 InlineKeyboardButton("🗑 Убрать", callback_data=f"hdrop:{_held_seq}")]])
@@ -617,7 +627,8 @@ async def cb_held_force(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _held_done[uid] = "переслано"
     await query.answer("Пересылаю во все таргеты…")
     log(f"✅ Админ разрешил пост с картинкой ({post['why']}) — пересылаю")
-    await _dispatch(ctx, post["tg_text"], post["dc_text"], post["file_id"], force=True)
+    await _dispatch(ctx, post["tg_text"], post["dc_text"], post["file_id"], force=True,
+                    src=SOURCES.get(post.get("src")))
     try:
         await query.edit_message_caption(caption=f"✅ Переслано вручную · {_hm()}\n{html.escape(post['why'])}",
                                          parse_mode=ParseMode.HTML)
@@ -809,8 +820,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
     status = "🟢 Вкл" if bridge_enabled else "🔴 Выкл"
+    sources = ", ".join(html.escape(s["label"] or str(cid)) for cid, s in SOURCES.items())
     await update.message.reply_text(
         f"📡 <b>Signal Bot</b>\n\n"
+        f"Источники: {sources}\n"
         f"Автопересылка: {status}\n"
         f"Активных каналов: {len(active_channels)} из {len(all_channels)}\n"
         f"Задержка: {_delay_text()}\n\n"
@@ -831,6 +844,16 @@ async def cmd_checkchats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     results = []
+
+    # каналы-источники: бот должен быть в них админом — иначе Telegram не присылает ему посты
+    for cid, src in SOURCES.items():
+        name = f"Источник {src['label']}" if src["label"] else "Источник"
+        try:
+            chat = await ctx.bot.get_chat(cid)
+            results.append(f"✅ {html.escape(name)}: <code>{cid}</code> — {html.escape(chat.title or '?')}")
+        except Exception as e:
+            results.append(f"❌ {html.escape(name)}: <code>{cid}</code> — {html.escape(repr(e))} "
+                           "(бот должен быть админом канала)")
 
     # TG #1 — основной бот
     if TARGET_CHAT_ID:
@@ -856,6 +879,22 @@ async def cmd_checkchats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         results.append("⚪ TG #2: BOT_TOKEN_2 не задан")
     else:
         results.append("⚪ TG #2: не задан")
+
+    # TG #3 — основной бот, английский
+    if TARGET_CHAT_ID_3:
+        name = html.escape(TARGET_LABEL_3)
+        try:
+            chat = await ctx.bot.get_chat(TARGET_CHAT_ID_3)
+            me = await ctx.bot.get_chat_member(TARGET_CHAT_ID_3, ctx.bot.id)
+            can = me.status == "creator" or (me.status == "administrator" and
+                                             (chat.type != "channel" or getattr(me, "can_post_messages", False)))
+            can = can or (chat.type != "channel" and me.status == "member")
+            results.append(f"{'✅' if can else '❌'} {name}: <code>{TARGET_CHAT_ID_3}</code>"
+                           f"{f' (thread {TARGET_MESSAGE_THREAD_ID_3})' if TARGET_MESSAGE_THREAD_ID_3 else ''}"
+                           f" — {html.escape(chat.title or '?')}"
+                           + ("" if can else " — у бота нет права публиковать (сделайте админом)"))
+        except Exception as e:
+            results.append(f"❌ {name}: <code>{TARGET_CHAT_ID_3}</code> — {html.escape(repr(e))}")
 
     # Аккаунт-таргеты (Telethon) — все подключённые аккаунты
     if user_accounts:
@@ -1403,20 +1442,6 @@ def split_text(text: str, limit: int = 1900) -> list[str]:
     return parts
 
 
-def send_discord_webhook_text(text: str) -> list:
-    ids = _send_webhook_text(DISCORD_WEBHOOK_URL, text)
-    if DISCORD_WEBHOOK_URL:
-        log("✅ Webhook Bee текст")
-    return ids
-
-
-def send_discord_webhook_photo(caption: str, image_bytes: bytes) -> list:
-    ids = _send_webhook_photo(DISCORD_WEBHOOK_URL, caption, image_bytes)
-    if DISCORD_WEBHOOK_URL:
-        log("✅ Webhook Bee фото")
-    return ids
-
-
 # ── Telegram senders (боты) — каждый канал в своём try/except + свой токен ───
 
 async def send_tg_text(context: ContextTypes.DEFAULT_TYPE, ru_text: str, en_text: str,
@@ -1818,39 +1843,68 @@ async def _send_heaven(context, is_photo: bool, dc_text: str, img_task: Optional
 
 
 async def _send_webhook_bee(dc_text: str, img_task: Optional[asyncio.Task], report: Report,
-                            bundle: Optional[dict]):
-    if not DISCORD_WEBHOOK_URL:
+                            bundle: Optional[dict], src: dict):
+    """Webhook Bee — у каждого источника свой (DISCORD_WEBHOOK_URL / DISCORD_WEBHOOK_URL_SOURCE_2)."""
+    url, label = src["bee"], src["bee_label"]
+    if not url:
         return
     img = await img_task if img_task is not None else None
     try:
         ids = []
         if img:
-            ids = await asyncio.to_thread(send_discord_webhook_photo, dc_text, img)
-            report.add("🌐 Discord webhook", "Bee", True)
+            ids = await asyncio.to_thread(_send_webhook_photo, url, dc_text, img)
+            log(f"✅ Webhook {label} фото")
+            report.add("🌐 Discord webhook", label, True)
         elif dc_text:
-            ids = await asyncio.to_thread(send_discord_webhook_text, dc_text)
-            report.add("🌐 Discord webhook", "Bee", True)
+            ids = await asyncio.to_thread(_send_webhook_text, url, dc_text)
+            log(f"✅ Webhook {label} текст")
+            report.add("🌐 Discord webhook", label, True)
         for mid in ids:
-            bundle_add(bundle, "webhook", "Webhook Bee", DISCORD_WEBHOOK_URL, mid)
+            bundle_add(bundle, "webhook", f"Webhook {label}", url, mid)
     except Exception as e:
-        log(f"❌ Webhook Bee error: {repr(e)}")
-        report.add("🌐 Discord webhook", "Bee", False, str(e)[:60])
+        log(f"❌ Webhook {label} error: {repr(e)}")
+        report.add("🌐 Discord webhook", label, False, str(e)[:60])
+
+
+async def _send_tg3(context, is_photo: bool, file_id: Optional[str], en_text: str,
+                    report: Report, bundle: Optional[dict]):
+    """TG #3 — английский оригинал без перевода. Шлёт основной бот: file_id фото у него свой,
+    поэтому карточка уходит сразу после проверки, без скачивания. Текст — как есть, без разметки."""
+    if not TARGET_CHAT_ID_3:
+        return
+    kw = {"message_thread_id": TARGET_MESSAGE_THREAD_ID_3} if TARGET_MESSAGE_THREAD_ID_3 else {}
+    try:
+        if is_photo:
+            m = await context.bot.send_photo(chat_id=TARGET_CHAT_ID_3, photo=file_id,
+                                             caption=(en_text or None) and en_text[:1024], **kw)
+        elif en_text:
+            m = await context.bot.send_message(chat_id=TARGET_CHAT_ID_3, text=en_text,
+                                               disable_web_page_preview=True, **kw)
+        else:
+            return
+        bundle_add(bundle, "bot1", TARGET_LABEL_3, TARGET_CHAT_ID_3, m.message_id)
+        log(f"✅ Sent {'photo' if is_photo else 'text'} to {TARGET_LABEL_3} (EN)")
+        report.add("📱 Telegram", TARGET_LABEL_3, True)
+    except Exception as e:
+        log(f"❌ {TARGET_LABEL_3} error: {repr(e)}")
+        report.add("📱 Telegram", TARGET_LABEL_3, False, str(e)[:60])
 
 
 # ── Handler ───────────────────────────────────────────────────────────────────
 
 post_lock = asyncio.Lock()   # посты — строго по одному и по порядку; команды при этом отвечают
 
-# Тег роли Discord (pings.py, переменная DISCORD_PING): решение — по каждому посту, по порядку
-PINGER = pings.Pinger()
+# Тег роли Discord (pings.py, переменная DISCORD_PING): решение — по каждому посту, по порядку;
+# память сделок у каждого источника своя (SOURCES[...]["pinger"])
+PINGER = SOURCES[SOURCE_CHANNEL]["pinger"]
 
 
-def _ping_decide(text: str) -> Optional[str]:
+def _ping_decide(text: str, src: Optional[dict] = None) -> Optional[str]:
     """Ставить ли тег на этот пост («вход», «закрытие», …) или None. Сбой правила пересылку не трогает."""
     if not pings.CONFIG or not text:
         return None
     try:
-        kind = PINGER.decide(text)
+        kind = (src or SOURCES[SOURCE_CHANNEL])["pinger"].decide(text)
     except Exception as e:
         log(f"⚠️ Тег: сбой правила ({repr(e)}) — пост уходит без тега")
         return None
@@ -1868,12 +1922,14 @@ async def _handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYP
     msg = update.channel_post
     if not msg:
         return
-    if str(msg.chat.id) != str(SOURCE_CHANNEL):
+    src = SOURCES.get(msg.chat.id)
+    if src is None:
         log(f"⏭ Skip: wrong channel ({msg.chat.id})")
         return
 
     raw_text = msg.text or msg.caption or ""
-    log(f"\n{'='*50}\n📨 Incoming:\n{raw_text[:400]}\n{'='*50}")
+    tag = _src_tag(src)
+    log(f"\n{'='*50}\n📨 Incoming{tag}:\n{raw_text[:400]}\n{'='*50}")
 
     reason = block_reason(raw_text)
     if reason:
@@ -1881,24 +1937,27 @@ async def _handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYP
         head = cut_ad_tail(raw_text)
         if not head:
             log(f"🚫 Пост отфильтрован: {reason}")
-            await send_blocked_report(context.bot, raw_text, reason)
+            await send_blocked_report(context.bot, raw_text, reason, tag=tag)
             return
         log(f"✂️ Вырезан рекламный хвост ({reason}) — сигнал уходит")
-        await send_blocked_report(context.bot, raw_text, reason, sent=head)
+        await send_blocked_report(context.bot, raw_text, reason, sent=head, tag=tag)
         raw_text = head
 
     tg_text = transform_for_telegram(raw_text)
     dc_text = transform_for_discord(raw_text) or ""
     file_id = msg.photo[-1].file_id if msg.photo else None
-    await _dispatch(context, tg_text, dc_text, file_id)
+    await _dispatch(context, tg_text, dc_text, file_id, src=src)
 
 
-async def _dispatch(context, tg_text: str, dc_text: str, file_id: Optional[str], force: bool = False):
-    """Рассылка поста по всем направлениям. force — админ разрешил картинку вручную."""
+async def _dispatch(context, tg_text: str, dc_text: str, file_id: Optional[str], force: bool = False,
+                    src: Optional[dict] = None):
+    """Рассылка поста по всем направлениям. force — админ разрешил картинку вручную.
+    src — канал-источник (SOURCES): от него зависят webhook Bee и память сделок для тега."""
+    src = src or SOURCES[SOURCE_CHANNEL]
     # Сводка о доставке — копится по ходу, уходит в самом конце.
     # В превью — английский оригинал (dc_text), русский только запасной вариант.
     preview = (dc_text or tg_text or "фото").splitlines()[0][:60] if (dc_text or tg_text) else "фото"
-    report  = Report(preview)
+    report  = Report(preview, _src_tag(src))
     bundle  = new_bundle(preview)   # связка ID всех отправок — для /posts
 
     # Отсчёт — с момента прихода поста. Каждое направление — своя очередь (см. _chain).
@@ -1915,7 +1974,7 @@ async def _dispatch(context, tg_text: str, dc_text: str, file_id: Optional[str],
     verdict_task = (asyncio.create_task(_photo_verdict(img_task))
                     if is_photo and not force else None)
     gate = lambda make: (lambda: _if_pass(verdict_task, make))
-    ping = _ping_decide(dc_text)
+    ping = _ping_decide(dc_text, src)
 
     tasks = []
     if is_photo:
@@ -1925,12 +1984,48 @@ async def _dispatch(context, tg_text: str, dc_text: str, file_id: Optional[str],
     launchers = []
     if is_photo or dc_text:
         tasks.append(_chain("heaven", gate(lambda: _send_heaven(context, is_photo, dc_text, img_task, report, bundle))))
-        tasks.append(_chain("bee", gate(lambda: _send_webhook_bee(dc_text, img_task, report, bundle))))
+        tasks.append(_chain("tg3", gate(lambda: _send_tg3(context, is_photo, file_id, dc_text, report, bundle))))
+        tasks.append(_chain(src["bee_chain"], gate(lambda: _send_webhook_bee(dc_text, img_task, report, bundle, src))))
         launchers.append(_chain("users", gate(lambda: _launch_users(dc_text, is_photo, img_task, report, bundle))))
         launchers.append(_chain("delayed", gate(lambda: delayed_send(dc_text, img_task, report, bot, file_id,
                                                                      bundle, arrived, ping))))
-    post = {"tg_text": tg_text, "dc_text": dc_text, "file_id": file_id}
+    post = {"tg_text": tg_text, "dc_text": dc_text, "file_id": file_id, "src": src["id"]}
     asyncio.create_task(_report_when_done(bot, report, bundle, tasks, launchers, verdict_task, post))
+
+
+def _chat_role(chat_id: int) -> str:
+    if chat_id in SOURCES:
+        return "это канал-источник ✅"
+    names = {TARGET_CHAT_ID: "TG #1", TARGET_CHAT_ID_2: "TG #2", TARGET_CHAT_ID_3: TARGET_LABEL_3}
+    if chat_id and chat_id in names:
+        return f"это таргет {names[chat_id]} ✅"
+    return "в переменных бота этого чата пока нет"
+
+
+async def on_my_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Бота добавили в канал/группу (или убрали) — админам название и ID: ID не нужно искать вручную,
+    а если таргет или источник убрал бота — это сразу видно."""
+    cm = update.my_chat_member
+    if not cm or cm.chat.type not in ("channel", "group", "supergroup"):
+        return
+    chat, new, old = cm.chat, cm.new_chat_member, cm.old_chat_member
+    title = html.escape(chat.title or "?")
+    who = html.escape(cm.from_user.full_name if cm.from_user else "?")
+    if new.status == "administrator" and old.status != "administrator":
+        can = chat.type != "channel" or getattr(new, "can_post_messages", False)
+        text = (f"➕ <b>Меня сделали админом</b>: {title}\nID: <code>{chat.id}</code>\n"
+                f"Кто: {who} · {_chat_role(chat.id)}"
+                + ("" if can else "\n⚠️ Права «Публикация сообщений» нет — постить туда я не смогу."))
+    elif new.status == "member" and old.status in ("left", "kicked"):
+        text = (f"➕ <b>Меня добавили</b>: {title}\nID: <code>{chat.id}</code>\n"
+                f"Кто: {who} · {_chat_role(chat.id)}")
+    elif new.status in ("left", "kicked") and old.status not in ("left", "kicked"):
+        text = (f"➖ <b>Меня убрали</b>: {title}\nID: <code>{chat.id}</code>\n"
+                f"Кто: {who} · {_chat_role(chat.id)}")
+    else:
+        return
+    log(f"👥 {text}")
+    await _deliver_report(ctx.bot, text)
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
@@ -1963,9 +2058,17 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_held_force,    pattern=r"^hforce:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_held_drop,     pattern=r"^hdrop:\d+$"))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
+    app.add_handler(ChatMemberHandler(on_my_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
     print("🚀 Signal filter bot started", flush=True)
-    app.run_polling(drop_pending_updates=True)
+    for cid, src in SOURCES.items():
+        print(f"📥 Источник{_src_tag(src) or ''}: {cid} · webhook {src['bee_label']}"
+              f"{'' if src['bee'] else ' — не задан'}", flush=True)
+    if TARGET_CHAT_ID_3:
+        print(f"📤 {TARGET_LABEL_3}: {TARGET_CHAT_ID_3} (EN, основной бот)", flush=True)
+    # явно: my_chat_member («меня добавили в канал») Telegram по умолчанию может не присылать
+    app.run_polling(drop_pending_updates=True,
+                    allowed_updates=["message", "channel_post", "callback_query", "my_chat_member"])
 
 
 if __name__ == "__main__":

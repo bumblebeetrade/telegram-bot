@@ -6,7 +6,9 @@
   • открывает позицию        «Long zest / 2nd dca 0.11 / Stops 0.107», «SHORT:$SKYAI/USDT ENTRY PRICE…»
   • доливает по рынку        «2nd dca here», «Entered 2nd dca at 3.12», «Added 100$ in pippin»
   • ставит / переносит стоп  «Stops changed to 3.41», «Keep Sl above 0.0211», «Tp 3.71»
-  • закрывает руками         «Closed», «Closed zest half for -8», «Closing for -15»
+  • закрывает руками         «Closed», «Closed zest half for -8», «Closing for -15», «Took some profits»
+  • отменяет ордер           «Cancel 2nd dca», «Remove the limit order»
+  • переворачивается         «Flip short», «Reverse to long», «Re-entry here»
   • в минусе без стопа       «Lost» / «-100», когда у сделки стопа не было (значит, закрыл руками)
 Без тега: убыток по стопу («Sl hit», «Lost», когда стоп был) — его и так все видят; итоги
 («Gained 24», «Balance-569»), «Both entries filled», «Holding», разговор.
@@ -67,20 +69,27 @@ def with_tag(text: str, role: str) -> str:
 _HEADER = re.compile(r"^.*\bchallenge\b.*$|^\s*trade\s*-?\s*\d+\s*$|^\s*announcement\b.*$", re.I | re.M)
 # стоп сработал — все и так видят
 _SL_HIT = re.compile(r"\b(?:sl|stops?|stop[\s-]*loss)\s*(?:got\s+|was\s+|is\s+)?(?:hit|triggered|taken)\b"
-                     r"|\bstopped\s*out\b|\bhit\s+(?:the\s+|my\s+)?(?:sl|stop)\b", re.I)
+                     r"|\bstopped\s*out\b|\bhit\s+(?:the\s+|my\s+)?(?:sl|stop)\b|\bliquidat(?:ed|ion)\b", re.I)
 # закрытие руками — подписчикам надо закрыть тоже (и в минус: «Closed for -100»). Слово «закрыть» —
 # только про позицию: в первых словах строки («Closed», «BTC long closed», «I m closing EVAA at 2.567»).
 # 27.11 «In less than 12 hours this group will be closed» получил тег — так больше нельзя.
 _CLOSE_WORD = re.compile(r"^(?:clos(?:e|ed|ing)|exit(?:ed|ing)?|book(?:ed|ing)?)$")
-_CLOSE_ANY = re.compile(r"\btook\s+profits?\b|\btp\s*\d?\s*(?:hit|done)\b|\btargets?\s*\d?\s*(?:hit|done|reached)\b"
-                        r"|\bcut\s+(?:the\s+|this\s+)?(?:trade|position|loss)", re.I)
+_CLOSE_ANY = re.compile(r"\b(?:took|take|taking|secure[ds]?|securing|book)\s+(?:some\s+|partial\s+|half\s+)?profits?\b"
+                        r"|\btp\s*\d?\s*(?:hit|done)\b|\btargets?\s*\d?\s*(?:hit|done|reached)\b"
+                        r"|\bcut\s+(?:the\s+|this\s+)?(?:trade|position|loss)|\bpartial(?:ly)?\s+clos", re.I)
+# отмена ордера — подписчикам надо отменить тоже («Cancel 2nd dca», «Remove the limit order»)
+_CANCEL = re.compile(r"\b(?:cancel(?:led|ed|ing)?|remove[d]?|delete[d]?)\b[^\n]{0,25}\b(?:orders?|limits?|entr(?:y|ies)|dca|tp|sl|stops?)\b",
+                     re.I)
+# переворот и перезаход: «Flip short», «Reverse to long», «Re-entry here»
+_FLIP = re.compile(r"\bflip(?:ped|ping)?\b|\brevers(?:e|ed|ing)\s+(?:to|position|the\s+position)\b|\bre-?entr(?:y|ies|ered)\b",
+                   re.I)
 # убыток: тег — только если у сделки не было стопа (значит, закрыл руками). Тоже только в начале строки
 # («Lost», «Lost pieverse-89», «Loss day today», «83 lost»): «The loss will be covered» — не убыток.
 _LOSS_LINE = re.compile(r"^\s*(?:lost|loss)\b|^\s*-?\s*\$?\d[\d.,]*\s*\$?\s+lost\b"
                         r"|^\s*\$?[a-z][a-z0-9]{1,14}\s+lost\b", re.I | re.M)   # «Aster lost -74»
 # речь о группе, канале, челлендже, реакциях — не действие по сделке, тега нет никогда
 _META = re.compile(r"\b(?:groups?|channels?|community|chats?|servers?|challenges?|reactions?|likes?|join(?:ing)?"
-                   r"|pinned|fees?|subscribers?|members?|onboard\w*)\b", re.I)
+                   r"|pinned|fees?|subscribers?|members?|onboard\w*|goodbye|farewell)\b", re.I)
 
 
 def _close_like(t: str) -> bool:
@@ -160,11 +169,13 @@ def classify(text: str) -> str | None:
         return None                                      # длинный текст, речь о группе — не действие
     if _close_like(t):
         return "закрытие"
+    if _CANCEL.search(t):
+        return "отмена ордера"
     if _LOSS_LINE.search(t):
         return "убыток"
     if _NOT_TRADE.search(t):
         return None                                      # вопросы, советы, разговор
-    if _OPEN.search(t) or _TEMPLATE.search(t):
+    if _OPEN.search(t) or _TEMPLATE.search(t) or _FLIP.search(t):
         return "вход"
     if _DCA_NOW.search(t):
         return "добор"
@@ -206,6 +217,8 @@ class Pinger:
             if key is not None:
                 trade = self.trades.setdefault(key, {"stop": False, "at": now})
                 trade["stop"] = trade["stop"] or stop
+                if kind == "отмена ордера" and re.search(_STOP_WORD, text, re.I):
+                    trade["stop"] = False                # «Remove Sl» — дальше сделка без стопа
                 trade["at"] = now
                 self.current = key
         if kind == "стоп сработал":
